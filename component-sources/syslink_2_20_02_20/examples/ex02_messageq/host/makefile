@@ -43,9 +43,9 @@ include ./rules.make
 GLES_DIR = $(GLES2_DIR)
 
 ##liuxu, 8/28/2013. 
-srcs = main_host.c App.c ParaMP4Enc.c ParaParser.c CallBack.c common.c AutoRadAVMLib.c AVM_Fun.c AVM_Homography.c createtexindex.c matrix.c model.c sgxRender3DSRV.c shader.c textures.c
+srcs = main_host.c App.c ParaMP4Enc.c ParaParser.c CallBack.c common.c
 
-srcs_cpp = customer_folder/111.cpp translate.cpp
+srcs_cpp = customer_folder/111.cpp
 
 EXBASE = ..
 include $(EXBASE)/products.mak

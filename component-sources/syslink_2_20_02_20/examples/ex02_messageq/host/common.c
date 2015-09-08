@@ -43,42 +43,105 @@
 #include <string.h>
 #include <linux/fb.h>
 #include "common.h"
-#include <GLES2/gl2.h>
-#include <EGL/egl.h>
-#include <GLES2/gl2ext.h>
 
 #define CUBE_V_LEN   1.8
 
 #define BARS     8  /*number of color bars*/
 #define STEPS   16  /*moving steps of a bar*/
 
-//#define WISH
-#define REDFLAG
-
-
+#ifdef GLES_20
 GLuint *ptex_objs;
 GLint model_view_idx[2], proj_idx[2];
 
+/* Shader program */
+int program[2];
 
+#ifndef DIRECT_SHOW
 
-/* 3D data. Vertex range -0.5..0.5 in all axes.
-* Z -0.5 is near, 0.5 is far. */
+float projection[16] = {
+    4.0f, 0.0f,  0.0f,  0.0f,
+    0.0f, 4.0f,  0.0f,  0.0f,
+    0.0f, 0.0f, -1.0f, -1.0f,
+    0.0f, 0.0f, -1.0f,  0.0f
+};
 
-void avm_line_init();
-//void avm_drawline_VBO();
-void avm_texture_init();
-void car_texture_init();
-
-
-#ifdef REDFLAG
-#include "London.h"
-#include "LondonWH.h"
-#include "LondonGL.h"
+float modelview[16] = {
+    1.0f, 0.0f,  0.0f, 0.0f,
+    0.0f, 1.0f,  0.0f, 0.0f,
+    0.0f, 0.0f,  1.0f, 0.0f,
+    0.0f, 0.0f, -9.0f, 1.0f
+};
 #else
-#include "jeep_object.h"
-#endif
-static int setup_shaders(int bcdev_id, int num_bufs);
 
+/*
+float projection[16] = {
+    1.0f, 0.0f,  0.0f,  0.0f,
+    0.0f, 1.0f,  0.0f,  0.0f,
+    0.0f, 0.0f,  1.0f,  0.0f,
+    0.0f, 0.0f,  0.0f,  1.0f
+};
+
+float modelview[16] = {
+    1.0f, 0.0f,  0.0f,  0.0f,
+    0.0f, 1.0f,  0.0f,  0.0f,
+    0.0f, 0.0f,  1.0f,  0.0f,
+    0.0f, 0.0f,  0.0f,  1.0f
+};
+*/
+//liuxu, 02/19/2014, for depth.
+float projection[16] = {
+    1.0f, 0.0f,  0.0f,  0.0f,
+    0.0f, 1.0f,  0.0f,  0.0f,
+    0.0f, 0.0f, -1.0f,  0.0f,
+    0.0f, 0.0f, -1.0f,  1.0f
+};
+float modelview[16] = {
+    1.0f, 0.0f,  0.0f,  0.0f,
+    0.0f, 1.0f,  0.0f,  0.0f,
+    0.0f, 0.0f,  1.0f,  0.0f,
+    0.0f, 0.0f, -1.0f,  1.0f
+};
+
+#endif
+
+/* Vertex shader */
+static const char *vshader_src =
+    "uniform mat4 modelview;\n"
+    "uniform mat4 projection;\n"
+    "attribute vec4 vertex;\n"
+    "attribute vec4 color;\n"
+    "attribute vec3 normal;\n"
+    "varying mediump vec4 v_color;\n"
+    "attribute vec2 inputtexcoord;\n"
+    "varying mediump vec2 texcoord;\n"
+    "void main()\n"
+    "{\n"
+    "   vec4 eye_vertex = modelview*vertex;\n"
+    "   gl_Position = projection*eye_vertex;\n"
+    "   v_color = color;\n" "   texcoord = inputtexcoord;\n" "}";
+
+/* Fragment shader */
+static const char *fshader_2 =
+    "#ifdef GL_IMG_texture_stream2\n"
+    "#extension GL_IMG_texture_stream2 : enable\n"
+    "#endif\n"
+    "varying mediump vec2 texcoord;\n"
+    "uniform samplerStreamIMG streamtexture;\n"
+    "varying mediump vec4 v_color;\n"
+    "void main(void)\n"
+    "{\n" "    gl_FragColor = textureStreamIMG(streamtexture, texcoord);\n"
+    //  "    gl_FragColor = v_color;\n"
+    "}";
+
+static const char *fshader_1 =
+    "void main(void)\n"
+    "{\n" "   gl_FragColor = vec4(1.0, 1.0, 0.0, 1.0);\n" "}";
+
+/* shader object handles */
+static int ver_shader, frag_shader[2];
+
+static int setup_shaders(int bcdev_id, int num_bufs);
+#endif
 
 int gQuit = FALSE;
 int profiling = FALSE;
@@ -89,7 +152,304 @@ EGLSurface surface = EGL_NO_SURFACE;
 
 static EGLContext context = EGL_NO_CONTEXT;
 
+#ifndef DIRECT_SHOW
 
+GLfloat cube_vertices[16][3] =
+{   // x     y     z
+    {-1.0, -1.0,  1.0}, // 1  left    First Strip
+    {-1.0,  1.0,  1.0}, // 3
+    {-1.0, -1.0, -1.0}, // 0
+    {-1.0,  1.0, -1.0}, // 2
+    { 1.0, -1.0, -1.0}, // 4  back
+    { 1.0,  1.0, -1.0}, // 6
+    { 1.0, -1.0,  1.0}, // 5  right
+    { 1.0,  1.0,  1.0}, // 7
+
+    { 1.0,  1.0, -1.0}, // 6  top     Second Strip
+    {-1.0,  1.0, -1.0}, // 2
+    { 1.0,  1.0,  1.0}, // 7
+    {-1.0,  1.0,  1.0}, // 3
+    { 1.0, -1.0,  1.0}, // 5  front
+    {-1.0, -1.0,  1.0}, // 1
+    { 1.0, -1.0, -1.0}, // 4  bottom
+    {-1.0, -1.0, -1.0}  // 0
+};
+
+GLfloat cube_normals[16][3] =    // One normal per vertex.
+{   // x     y     z
+    {-0.5, -0.5,  0.5}, // 1  left          First Strip
+    {-0.5,  0.5,  0.5}, // 3
+    {-0.5, -0.5, -0.5}, // 0
+    {-0.5,  0.5, -0.5}, // 2
+    { 0.5, -0.5, -0.5}, // 4  back
+    { 0.5,  0.5, -0.5}, // 6
+    { 0.5, -0.5,  0.5}, // 5  right
+    { 0.5,  0.5,  0.5}, // 7
+
+    { 0.5,  0.5, -0.5}, // 6  top           Second Strip
+    {-0.5,  0.5, -0.5}, // 2
+    { 0.5,  0.5,  0.5}, // 7
+    {-0.5,  0.5,  0.5}, // 3
+    { 0.5, -0.5,  0.5}, // 5  front
+    {-0.5, -0.5,  0.5}, // 1
+    { 0.5, -0.5, -0.5}, // 4  bottom
+    {-0.5, -0.5, -0.5}  // 0
+};
+
+GLfloat cube_tex_coords[16][2] =
+{   // x   y
+    {0.0, 1.0}, // 1  left                  First Strip
+    {0.0, 0.0}, // 3
+    {1.0, 1.0}, // 0
+    {1.0, 0.0}, // 2
+    {0.0, 1.0}, // 4  back
+    {0.0, 0.0}, // 6
+    {1.0, 1.0}, // 5  right
+    {1.0, 0.0}, // 7
+
+    {0.0, 1.0}, // 1  top                   Second Strip
+    {1.0, 1.0}, // 3
+    {0.0, 0.0}, // 0
+    {1.0, 0.0}, // 2
+    {0.0, 1.0}, // 4  front
+    {1.0, 1.0}, // 6
+    {0.0, 0.0}, // 5  bottom
+    {1.0, 0.0}  // 7
+};
+#else
+
+#ifdef SIDE_VIEW//liuxu, 06/02/2014.
+
+
+GLfloat cube_vertices[12][3] =
+{   // x     y     z
+    {-1.0,  1.0,  -1.0},//liuxu, 02/19/2014, for depth test, otherwise, -0.9. RISK... 
+    {-1.0, -1.0,  -1.0}, 
+    { 1.0,  1.0,  -1.0}, 
+    {-1.0, -1.0,  -1.0}, 
+    { 1.0, -1.0,  -1.0}, 
+    { 1.0,  1.0,  -1.0}, 
+
+#if 0
+    {-0.1307,  1.0,   -0.9},//liuxu, 02/19/2014, for depth test, otherwise, -0.9. RISK... 
+    {-0.1307, -0.0667,   -0.9}, 
+    { 1.0,  1.0,  -0.9}, 
+    {-0.1307, -0.0667,   -0.9}, 
+    { 1.0, -0.0667,  -0.9}, 
+    { 1.0,  1.0,  -0.9}, 
+#else
+    {-0.2458,  1.0,   -0.9},//liuxu, 06/16/2014, overlap right side of stitched out by 30 pixels.
+    {-0.2458, -0.2167,   -0.9}, 
+    { 1.0,  1.0,  -0.9}, 
+    {-0.2458, -0.2167,   -0.9}, 
+    { 1.0, -0.2167,  -0.9},// -0.0667
+    { 1.0,  1.0,  -0.9}, 
+#endif
+};
+
+GLfloat cube_tex_coords[12][2] =
+{   // x   y
+
+#if 0
+    {0.0, 0.0}, 
+    {0.0, 1.0}, 
+    {1.0, 0.0}, 
+    {0.0, 1.0}, 
+    {1.0, 1.0}, 
+    {1.0, 0.0},
+#else
+    {0.02717, 0.0}, //liuxu, 06/16/2014, cut 20 pixels of left.
+    {0.02717, 1.0}, 
+    {1.0, 0.0}, 
+    {0.02717, 1.0}, 
+    {1.0, 1.0}, 
+    {1.0, 0.0},
+
+#endif
+//liuxu, 06/03/2014, tex alignment/16 skip.
+
+#if 0//liuxu, 06/05/2014, just cut 16bytes alignment.
+    {0.0, 0.0}, 
+    {0.0, 1.0}, 
+    {0.9783, 0.0}, 
+    {0.0, 1.0}, 
+    {0.9783, 1.0}, 
+    {0.9783, 0.0}, 
+#else//liuxu, 06/05/2014, cut 1/8 of each of 4 edges of texture.
+    {0.1916, 0.1958}, 
+    {0.1916, 0.8042}, 
+    {0.7867, 0.1958}, 
+    {0.1916, 0.8042}, 
+    {0.7867, 0.8042}, 
+    {0.7867, 0.1958}, 
+
+#endif
+};
+
+#else
+
+GLfloat cube_vertices[6][3] =
+{   // x     y     z
+    {-1.0,  1.0,  -1.0},//liuxu, 02/19/2014, for depth test, otherwise, -0.9. RISK... 
+    {-1.0, -1.0,  -1.0}, 
+    { 1.0,  1.0,  -1.0}, 
+    {-1.0, -1.0,  -1.0}, 
+    { 1.0, -1.0,  -1.0}, 
+    { 1.0,  1.0,  -1.0}, 
+};
+
+GLfloat cube_tex_coords[6][2] =
+{   // x   y
+    {0.0, 0.0}, 
+    {0.0, 1.0}, 
+    {1.0, 0.0}, 
+    {0.0, 1.0}, 
+    {1.0, 1.0}, 
+    {1.0, 0.0}, 
+};
+#endif
+//liuxu, 02/16/2014, unused actually. 
+GLfloat cube_normals[6][3] =    // One normal per vertex.
+{   // x     y     z
+    {-0.5, -0.5,  0.5}, // 1  left          First Strip
+    {-0.5,  0.5,  0.5}, // 3
+    {-0.5, -0.5, -0.5}, // 0
+    {-0.5,  0.5, -0.5}, // 2
+    { 0.5, -0.5, -0.5}, // 4  back
+    { 0.5,  0.5, -0.5}, // 6
+    
+};
+
+//liuxu, 02/18/2014.
+#ifdef TINY_CUBE
+GLfloat cube_vertices_tiny[16][3] =
+{   // x     y     z
+    {-1.0, -1.0,  1.0}, // 1  left    First Strip
+    {-1.0,  1.0,  1.0}, // 3
+    {-1.0, -1.0, -1.0}, // 0
+    {-1.0,  1.0, -1.0}, // 2
+    { 1.0, -1.0, -1.0}, // 4  back
+    { 1.0,  1.0, -1.0}, // 6
+    { 1.0, -1.0,  1.0}, // 5  right
+    { 1.0,  1.0,  1.0}, // 7
+
+    { 1.0,  1.0, -1.0}, // 6  top     Second Strip
+    {-1.0,  1.0, -1.0}, // 2
+    { 1.0,  1.0,  1.0}, // 7
+    {-1.0,  1.0,  1.0}, // 3
+    { 1.0, -1.0,  1.0}, // 5  front
+    {-1.0, -1.0,  1.0}, // 1
+    { 1.0, -1.0, -1.0}, // 4  bottom
+    {-1.0, -1.0, -1.0}  // 0
+};
+
+GLfloat cube_tex_coords_tiny[16][2] =
+{   // x   y
+    {0.0, 1.0}, // 1  left                  First Strip
+    {0.0, 0.0}, // 3
+    {1.0, 1.0}, // 0
+    {1.0, 0.0}, // 2
+    {0.0, 1.0}, // 4  back
+    {0.0, 0.0}, // 6
+    {1.0, 1.0}, // 5  right
+    {1.0, 0.0}, // 7
+
+    {0.0, 1.0}, // 1  top                   Second Strip
+    {1.0, 1.0}, // 3
+    {0.0, 0.0}, // 0
+    {1.0, 0.0}, // 2
+    {0.0, 1.0}, // 4  front
+    {1.0, 1.0}, // 6
+    {0.0, 0.0}, // 5  bottom
+    {1.0, 0.0}  // 7
+};
+/*
+float modelview_tiny[16] = {
+    1.0f, 0.0f,  0.0f,  0.0f,
+    0.0f, 1.0f,  0.0f,  0.0f,
+    0.0f, 0.0f,  1.0f,  0.0f,
+    0.0f, 0.0f,  0.0f,  1.0f
+};
+*/
+//liuxu, 02/19/2014, for depth.
+float modelview_tiny[16] = {
+    1.0f, 0.0f,  0.0f,  0.0f,
+    0.0f, 1.0f,  0.0f,  0.0f,
+    0.0f, 0.0f,  1.0f,  0.0f,
+    0.0f, 0.0f, -1.0f,  1.0f
+};
+
+#endif
+//end
+
+#endif
+int colors[BARS] = {
+           /* y       |   v       |   y      | u */
+            128 << 24 | 128 << 16 | 128 << 8 | 128, /* white  */
+            162 << 24 | 142 << 16 | 162 << 8 |  44, /* yellow */
+            131 << 24 |  44 << 16 | 131 << 8 | 156, /* cyan   */
+            112 << 24 |  58 << 16 | 112 << 8 |  72, /* green  */
+             84 << 24 | 198 << 16 |  84 << 8 | 184, /* mag    */
+             65 << 24 | 212 << 16 |  65 << 8 | 100, /* red    */
+             35 << 24 | 114 << 16 |  35 << 8 | 212, /* blue   */
+             16 << 24 | 128 << 16 |  16 << 8 | 128  /* black  */
+
+};
+
+void pattern_uyvy(int fr_idx, void *p, int w, int h)
+{
+#ifdef USE_SOLID_PATTERN
+    unsigned int pattern = 0;
+    unsigned int* pBuff = (unsigned int*)p;
+
+    switch (fr_idx & 0x3)
+    {
+        case 0 : pattern = 0x51f0515a; printf("Red\n"); break; // Red
+        case 1 : pattern = 0x91219135; printf("Green\n"); break; // Green
+        case 2 : pattern = 0x296d29f0; printf("Blue\n"); break; // Blue
+        case 3 : pattern = 0xeb80eb80; printf("White\n");  break; // White
+    }
+
+    int r,c;
+    for (r = 0; r < h; r++)
+    {
+        for (c = 0; c < w; c += 2)
+        {
+            *pBuff++ = pattern;
+        }
+    }
+
+#else
+    static int moves = 0;
+	unsigned int *t = (unsigned int *)p;
+	int ii, jj, kk, c0, c;
+
+    (void)fr_idx;
+
+    /*first partial strip*/
+    c0 = colors[(moves/STEPS)%BARS];
+    for (jj = 0; jj < h/BARS/STEPS * (STEPS - moves%STEPS); jj++) {
+        for (ii = 0; ii < w; ii += 2)
+            *t++ = c0;
+    }
+
+    /*all middle complete strips*/
+    for (kk = 1; kk < BARS; kk++) {
+        c = colors[(kk + moves/STEPS)%BARS];
+        for (jj = 0; jj < h/BARS; jj++) {
+            for (ii = 0; ii < w; ii += 2)
+                *t++ = c;
+        }
+    }
+
+    /*the remder partial strip*/
+    for (jj = 0; jj < h/BARS/STEPS * (moves%STEPS); jj++) {
+        for (ii = 0; ii < w; ii += 2)
+            *t++ = c0;
+    }
+    moves++;
+#endif
+}
 
 void signalHandler(int signum) { (void)signum; gQuit=TRUE; }
 
@@ -108,9 +468,8 @@ int get_disp_resolution(int *w, int *h)
         goto exit;
     }
 
-    *w = vinfo.xres; 	//704    
-    *h = vinfo.yres;	//480
-
+    *w = vinfo.xres;
+    *h = vinfo.yres;
 
     if (*w && *h)
         ret = 0;
@@ -120,7 +479,117 @@ exit:
     return ret;
 }
 
+#ifdef X11
+Display* x11Display  = 0;
+Window   x11Window   = 0;
+Colormap x11Colormap = 0;
 
+int initX11(int *w, int *h)
+{
+    long                 screen = 0;
+    XVisualInfo          visual;
+    Window               rootWin;
+    XSetWindowAttributes wa;
+    unsigned int         mask;
+    int                  depth;
+    int                  width;
+    int                  height;
+
+    if (!(x11Display = XOpenDisplay(":0"))) {
+        printf("Error: Unable to open X display\n");
+        return -1;
+    }
+    screen = XDefaultScreen(x11Display);
+
+    width = DisplayWidth(x11Display, screen);
+    height = DisplayHeight(x11Display, screen);
+    rootWin = RootWindow(x11Display, screen);
+    depth = DefaultDepth(x11Display, screen);
+
+    if (!XMatchVisualInfo(x11Display, screen, depth, TrueColor, &visual)) {
+        printf("Error: Unable to acquire visual\n");
+        XCloseDisplay(x11Display);
+        return -1;
+    }
+    x11Colormap = XCreateColormap(x11Display, rootWin,
+                                  visual.visual, AllocNone);
+    wa.colormap = x11Colormap;
+
+    wa.event_mask = StructureNotifyMask | ExposureMask;
+    mask = CWBackPixel | CWBorderPixel | CWEventMask | CWColormap;
+
+    x11Window = XCreateWindow(x11Display, rootWin,
+                              0, 0, width/4*3, height/4*3,
+                              0, CopyFromParent, InputOutput,
+                              CopyFromParent, mask, &wa);
+    XMapWindow(x11Display, x11Window);
+    XFlush(x11Display);
+
+    if (w) *w = width;
+    if (h) *h = height;
+
+    return 0;
+}
+
+void deInitX11(void)
+{
+    if (x11Window)
+        XDestroyWindow(x11Display, x11Window);
+    if (x11Colormap)
+        XFreeColormap(x11Display, x11Colormap);
+    if (x11Display)
+        XCloseDisplay(x11Display);
+}
+
+int doX11Events(void)
+{
+    int ii, w, h;
+    float r;
+    XEvent e;
+    Atom wdw;
+
+    wdw = XInternAtom(x11Display, "WM_DELETE_WINDOW", False); 
+    XSetWMProtocols(x11Display, x11Window, &wdw, 1);
+
+    for (ii = 0; ii < XPending(x11Display); ii++) {
+        XNextEvent(x11Display, &e);
+ 
+        switch (e.type) {
+        case ClientMessage:
+            /* WM_DELETE_WINDOW - terminate */
+            if ((Atom)e.xclient.data.l[0] == wdw)
+                return 1;
+            break; 
+        case ConfigureNotify:
+            w = e.xconfigure.width;
+            h = e.xconfigure.height;
+            r = (float)w / h;
+
+            glViewport(0, 0, w, h);
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+
+            if (w > h)
+                glOrthof(-CUBE_V_LEN * r, CUBE_V_LEN * r, -CUBE_V_LEN,
+                         CUBE_V_LEN, -CUBE_V_LEN * 2, CUBE_V_LEN * 2);
+            else
+                glOrthof(-CUBE_V_LEN, CUBE_V_LEN, -CUBE_V_LEN / r,
+                         CUBE_V_LEN / r, -CUBE_V_LEN * 2, CUBE_V_LEN * 2);
+
+            glMatrixMode(GL_MODELVIEW);
+            glLoadIdentity();
+
+            break;
+        case Expose:
+            /*must handle this, otherwise, background does not redraw*/
+            break;
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+#endif
 
 int initTexExt(int bcdev_id, tex_buffer_info_t *binfo)
 {
@@ -135,8 +604,11 @@ int initTexExt(int bcdev_id, tex_buffer_info_t *binfo)
     if (!(glext = glGetString(GL_EXTENSIONS)))
         return -1;
 
+#ifdef GLES_20
     if (!strstr((char *)glext, "GL_IMG_texture_stream2"))
-
+#else
+    if (!strstr((char *)glext, "GL_IMG_texture_stream"))
+#endif
         return -2;
 
     glTexBindStreamIMG =
@@ -158,9 +630,10 @@ int initTexExt(int bcdev_id, tex_buffer_info_t *binfo)
     glGetTexAttrIMG(bcdev_id, GL_TEXTURE_STREAM_DEVICE_HEIGHT_IMG, &binfo->h);
     glGetTexAttrIMG(bcdev_id, GL_TEXTURE_STREAM_DEVICE_FORMAT_IMG, &binfo->fmt);
 
+#ifdef GLES_20
     if (setup_shaders(bcdev_id, binfo->n))
         return -5;
-
+#endif
 
     printf("\ndevice: %s num: %d, width: %d, height: %d, format: 0x%x\n",
         dev_name, binfo->n, binfo->w, binfo->h, binfo->fmt);
@@ -194,7 +667,7 @@ static void print_err(char *name)
 
 void deInitEGL(int n_buf)
 {
-
+#ifdef GLES_20
     if (ptex_objs) {
         glDeleteTextures (n_buf, ptex_objs);
         glDisable(GL_TEXTURE_STREAM_IMG);
@@ -202,6 +675,16 @@ void deInitEGL(int n_buf)
         ptex_objs = NULL;
     }
    
+    /* clean up shaders */
+    glDeleteProgram(program[0]);
+    glDeleteProgram(program[1]);
+    glDeleteShader(ver_shader);
+    glDeleteShader(frag_shader[0]);
+    glDeleteShader(frag_shader[1]);
+#else
+    (void)n_buf;
+#endif
+
     eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (context != EGL_NO_CONTEXT)
         eglDestroyContext(dpy, context);
@@ -212,8 +695,12 @@ void deInitEGL(int n_buf)
 
 int initEGL(int n_buf)
 {
-
+#ifdef GLES_20
     EGLint  context_attr[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+#else
+    typedef NativeDisplayType EGLNativeDisplayType;
+    typedef NativeWindowType EGLNativeWindowType;
+#endif
 
     EGLint            disp_w, disp_h;
     EGLNativeDisplayType disp_type;
@@ -226,9 +713,18 @@ int initEGL(int n_buf)
                          EGL_GREEN_SIZE,  8,
                          EGL_BLUE_SIZE,   8,
                          EGL_DEPTH_SIZE,  8,
+#ifdef GLES_20
                          EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+#endif
                          EGL_NONE };
 
+#ifdef X11
+    if (initX11(&disp_w, &disp_h))
+        return -1;
+
+    disp_type = (EGLNativeDisplayType)x11Display;
+    window = (EGLNativeWindowType)x11Window;
+#else
     if (get_disp_resolution(&disp_w, &disp_h)) {
         printf("ERROR: get display resolution failed\n");
         return -1;
@@ -238,7 +734,7 @@ int initEGL(int n_buf)
 
     disp_type = (EGLNativeDisplayType)EGL_DEFAULT_DISPLAY;
     window  = 0;
-
+#endif
 
     dpy = eglGetDisplay(disp_type);
 
@@ -263,8 +759,11 @@ int initEGL(int n_buf)
         goto cleanup;
     }
 
+#ifdef GLES_20
     context = eglCreateContext(dpy, cfgs[0], EGL_NO_CONTEXT, context_attr);
-
+#else
+    context = eglCreateContext(dpy, cfgs[0], EGL_NO_CONTEXT, NULL);
+#endif
     if (context == EGL_NO_CONTEXT) {
         print_err("eglCreateContext");
         goto cleanup;
@@ -283,15 +782,39 @@ int initEGL(int n_buf)
         }
     }
 
+#ifndef GLES_20
+    glShadeModel(GL_FLAT);
+    glTexParameterf(GL_TEXTURE_STREAM_IMG, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameterf(GL_TEXTURE_STREAM_IMG, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+    glFrontFace(GL_CW);
+    glCullFace(GL_FRONT);
+    glEnable(GL_CULL_FACE);
+
+    glEnable(GL_NORMALIZE);
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+
+    glOrthof(-CUBE_V_LEN * disp_w / disp_h, CUBE_V_LEN * disp_w / disp_h,
+             -CUBE_V_LEN, CUBE_V_LEN, -CUBE_V_LEN * 2, CUBE_V_LEN * 2);
+
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+#endif
 
     return 0;
 
 cleanup:
     deInitEGL(n_buf);
+#ifdef X11
+    deInitX11();
+#endif
     return -1;
 }
 
 
+#ifdef GLES_20
 int reset_shaders_idx0(int bcdev_id)//liuxu, 10/10/2013.
 {
 
@@ -313,22 +836,97 @@ static int setup_shaders(int bcdev_id, int num_bufs)
 {
     int status, idx;
 
-    printf("\r\n avm setup_shaders init \n");
+    if (num_bufs <= 0)
+        return -1;
 
-    model_create(&bottom_avm,&top_avm, carwidth, carlength, 1, 5);
-    Line_index_create(&bottom_line_avm, &top_line_avm, carwidth, carlength, 1, 5);
-    Triangles_index_create(&bottom_tri_avm, &top_tri_avm, carwidth, carlength, 1, 5);
-    texture_vertex_create(&bottom_texture_avm, &top_texture_avm, carwidth, carlength, 1, 5);
-    overlap_create(&overlap_alpha);
-    avm_line_init();   				//line init!!!!!!!!!!!!!!!!!!!!!!!              
-    avm_texture_init();             //texture init!!!!!!!!!!!!!!!!!!!!!!!
-	car_texture_init();
+    /* Initialize shaders */
+    ver_shader     = glCreateShader(GL_VERTEX_SHADER);
+    frag_shader[0] = glCreateShader(GL_FRAGMENT_SHADER);
+    frag_shader[1] = glCreateShader(GL_FRAGMENT_SHADER);
+   
+    /* Attach and compile shaders */
+    glShaderSource(ver_shader, 1, (const char **) &vshader_src, NULL);
+    glCompileShader(ver_shader);
+   
+    glGetShaderiv(ver_shader, GL_COMPILE_STATUS, &status);
+    if (status != GL_TRUE) {
+        char buf[1024];
 
+        glGetShaderInfoLog(ver_shader, sizeof (buf), NULL, buf);
+        printf("ERROR: Vertex shader compilation failed, info log:\n%s", buf);
+        return -1;
+    }
+   
+    for (idx = 0; idx < 2; idx++) {
+        if (idx == 0)
+            glShaderSource(frag_shader[idx], 1, (const char **) &fshader_1, NULL);
+        else
+            glShaderSource(frag_shader[idx], 1, (const char **) &fshader_2, NULL);
+   
+        glCompileShader(frag_shader[idx]);
+   
+        glGetShaderiv(frag_shader[idx], GL_COMPILE_STATUS, &status);
+        if (status != GL_TRUE) {
+            char buf[1024];
 
+            glGetShaderInfoLog(frag_shader[idx], sizeof (buf), NULL, buf);
+            printf("ERROR: Fragment shader compilation failed, info log:\n%s", buf);
+            return -1;
+        }
+   
+        program[idx] = glCreateProgram();
+   
+        /* Attach shader to the program */
+        glAttachShader(program[idx], ver_shader);
+        glAttachShader(program[idx], frag_shader[idx]);
+   
+        /* associating the program attributes */
+        glBindAttribLocation(program[idx], 0, "vertex");
+        glBindAttribLocation(program[idx], 1, "normal");
+        glBindAttribLocation(program[idx], 2, "inputtexcoord");
+   
+        /* link the program */
+        glLinkProgram(program[idx]);
+   
+        glGetProgramiv(program[idx], GL_LINK_STATUS, &status);
+        if (status != GL_TRUE) {
+            char buf[1024];
 
-    printf("\r\n avm setup_shaders end \n");
+            glGetProgramInfoLog(program[idx], sizeof (buf), NULL, buf);
+            printf("ERROR: Program linking failed, info log:\n%s", buf);
+            return -1;
+        }
+   
+        glValidateProgram(program[idx]);
+   
+        glGetProgramiv(program[idx], GL_VALIDATE_STATUS, &status);
+        if (status != GL_TRUE) {
+            char buf[1024];
 
+            glGetProgramInfoLog(program[idx], sizeof (buf), NULL, buf);
+            printf("ERROR: Program validation failed, info log:\n%s", buf);
+            return -1;
+        }
+   
+        /* pass the model view and projection matrix to shader */
+        model_view_idx[idx] = glGetUniformLocation (program[idx], "modelview");
+        proj_idx[idx] = glGetUniformLocation (program[idx], "projection");
+    }
+   
+    /* assign the vertices and their texture co-ords */
+   
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glEnableVertexAttribArray(2);
+   
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, cube_vertices);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, cube_normals);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, cube_tex_coords);
 
+ //#ifndef TINY_CUBE  
+    glEnable(GL_DEPTH_TEST);
+ //#endif   
+    glDepthFunc(GL_LEQUAL);
    
     /* allocate texture objects */
     ptex_objs = malloc(sizeof (GLuint) * num_bufs);
@@ -340,7 +938,7 @@ static int setup_shaders(int bcdev_id, int num_bufs)
    
     /* activate texture unit */
     glActiveTexture(GL_TEXTURE0);
-	
+   
     /* associate buffers to textures */
     for (idx = 0; idx < num_bufs; idx++) {
       glBindTexture (GL_TEXTURE_STREAM_IMG, ptex_objs[idx]);
@@ -355,451 +953,4 @@ static int setup_shaders(int bcdev_id, int num_bufs)
    
     return 0;
 }
-
-
-
-void avm_line_init()
-{
-   BFB_size=(FBVslices+1)*(Cslices+1)*3;
-    BLR_size=(LRVslices+1)*(Cslices+1)*3;
-    BC_size=(Vslices+1)*Cslices*3+3;
-
-    TFB_size=(FBVslices+1)*(Hslices+1)*3;
-    TLR_size=(LRVslices+1)*(Hslices+1)*3;
-    TC_size=(Vslices+1)*(Hslices+1)*3;
-
-
-    BFBL_index_size=(FBVslices*(Cslices+1)+(FBVslices+1)*(Cslices))*2;     //BFBL(bottom front back line)
-    BLRL_index_size=(LRVslices*(Cslices+1)+(LRVslices+1)*(Cslices))*2;
-    BCL_index_size=((Vslices*Cslices)+((Vslices+1)*Cslices))*2;
-
-    TFBL_index_size=(FBVslices*(Hslices)+(FBVslices+1)*(Hslices))*2;
-    TLRL_index_size=(LRVslices*(Hslices)+(LRVslices+1)*(Hslices))*2;
-    TCL_index_size=((Vslices*Hslices)+((Vslices+1)*Hslices))*2;
-
-    /*shader_line_init(&bottom_front);
-    vertices_line_init(&bottom_front, bottom_avm._front, BFB_size, aColours, BFB_size, bottom_line_avm.front_back, BFBL_index_size);
-
-    shader_line_init(&bottom_back);
-    vertices_line_init(&bottom_back,  bottom_avm._back,  BFB_size, aColours, BFB_size, bottom_line_avm.front_back, BFBL_index_size);
-
-    shader_line_init(&bottom_right);
-    vertices_line_init(&bottom_right, bottom_avm.right, BLR_size, aColours, BLR_size, bottom_line_avm.right_left, BLRL_index_size);
-    shader_line_init(&bottom_left);
-    vertices_line_init(&bottom_left,  bottom_avm.left,  BLR_size, aColours, BLR_size, bottom_line_avm.right_left, BLRL_index_size);
-
-    shader_line_init(&Bfront_right);
-    vertices_line_init(&Bfront_right, bottom_avm.front_right, BC_size, aColours, BC_size, bottom_line_avm.circle, BCL_index_size);
-    shader_line_init(&Bfront_left);
-    vertices_line_init(&Bfront_left, bottom_avm.front_left, BC_size, aColours, BC_size, bottom_line_avm.circle, BCL_index_size);
-
-    shader_line_init(&Bback_right);
-    vertices_line_init(&Bback_right, bottom_avm.back_right, BC_size, aColours, BC_size, bottom_line_avm.circle, BCL_index_size);
-    shader_line_init(&Bback_left);
-    vertices_line_init(&Bback_left, bottom_avm.back_left, BC_size, aColours, BC_size, bottom_line_avm.circle, BCL_index_size);
-
-    shader_line_init(&Bright_up);
-    vertices_line_init(&Bright_up, bottom_avm.right_up, BC_size, aColours, BC_size, bottom_line_avm.circle, BCL_index_size);
-    shader_line_init(&Bright_down);
-    vertices_line_init(&Bright_down, bottom_avm.right_down, BC_size, aColours, BC_size, bottom_line_avm.circle, BCL_index_size);
-
-    shader_line_init(&Bleft_up);
-    vertices_line_init(&Bleft_up, bottom_avm.left_up, BC_size, aColours, BC_size, bottom_line_avm.circle, BCL_index_size);
-    shader_line_init(&Bleft_down);
-    vertices_line_init(&Bleft_down, bottom_avm.left_down, BC_size, aColours, BC_size, bottom_line_avm.circle, BCL_index_size);
-
-
-    shader_line_init(&top_front);
-    vertices_line_init(&top_front, top_avm._front, TFB_size, aColours, TFB_size, top_line_avm.front_back, TFBL_index_size);
-    shader_line_init(&top_back);
-    vertices_line_init(&top_back,  top_avm._back,  TFB_size, aColours, TFB_size, top_line_avm.front_back, TFBL_index_size);
-
-    shader_line_init(&top_right);
-    vertices_line_init(&top_right, top_avm.right, TLR_size, aColours, TLR_size, top_line_avm.right_left, TLRL_index_size);
-    shader_line_init(&top_left);
-    vertices_line_init(&top_left,  top_avm.left,  TLR_size, aColours, TLR_size, top_line_avm.right_left, TLRL_index_size);
-
-    shader_line_init(&Tfront_right);
-    vertices_line_init(&Tfront_right, top_avm.front_right, TC_size, aColours, TC_size, top_line_avm.circle, TCL_index_size);
-    shader_line_init(&Tfront_left);
-    vertices_line_init(&Tfront_left, top_avm.front_left, TC_size, aColours, TC_size, top_line_avm.circle, TCL_index_size);
-
-    shader_line_init(&Tback_right);
-    vertices_line_init(&Tback_right, top_avm.back_right, TC_size, aColours, TC_size, top_line_avm.circle, TCL_index_size);
-    shader_line_init(&Tback_left);
-    vertices_line_init(&Tback_left, top_avm.back_left, TC_size, aColours, TC_size, top_line_avm.circle, TCL_index_size);
-
-    shader_line_init(&Tright_up);
-    vertices_line_init(&Tright_up, top_avm.right_up, TC_size, aColours, TC_size, top_line_avm.circle, TCL_index_size);
-    shader_line_init(&Tright_down);
-    vertices_line_init(&Tright_down, top_avm.right_down, TC_size, aColours, TC_size, top_line_avm.circle, TCL_index_size);
-
-    shader_line_init(&Tleft_up);
-    vertices_line_init(&Tleft_up, top_avm.left_up, TC_size, aColours, TC_size, top_line_avm.circle, TCL_index_size);
-    shader_line_init(&Tleft_down);
-    vertices_line_init(&Tleft_down, top_avm.left_down, TC_size, aColours, TC_size, top_line_avm.circle, TCL_index_size);*/
-}
-/*
-void avm_drawline_VBO()
-{
-    int iXangle = 0, iYangle = 0, iZangle = 0;
-    float aRotate[16], aModelView[16], aPerspective[16];
-
-    rotate_matrix(iXangle, 1.0, 0.0, 0.0, aModelView);
-    rotate_matrix(iYangle, 0.0, 1.0, 0.0, aRotate);
-
-    multiply_matrix(aRotate, aModelView, aModelView);
-
-    rotate_matrix(iZangle, 0.0, 1.0, 0.0, aRotate);
-
-    multiply_matrix(aRotate, aModelView, aModelView);
-
-
-    aModelView[14] -= 55;//2.5
-
-    perspective_matrix(90.0, (double)uiWidth/(double)uiHeight, 0.01, 200.0, aPerspective);
-    multiply_matrix(aPerspective, aModelView, aMVP);
-
-    GL_CHECK(glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT));
-
-    avm_line_restore_vbo(&bottom_front);
-    GL_CHECK(glUniformMatrix4fv(bottom_front.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BFBL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&bottom_back);
-    GL_CHECK(glUniformMatrix4fv(bottom_back.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BFBL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&bottom_right);
-    GL_CHECK(glUniformMatrix4fv(bottom_right.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BLRL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&bottom_left);
-    GL_CHECK(glUniformMatrix4fv(bottom_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BLRL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Bfront_right);
-    GL_CHECK(glUniformMatrix4fv(Bfront_right.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Bfront_left);
-    GL_CHECK(glUniformMatrix4fv(Bfront_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Bback_right);
-    GL_CHECK(glUniformMatrix4fv(Bback_right.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Bback_left);
-    GL_CHECK(glUniformMatrix4fv(Bback_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Bright_up);
-    GL_CHECK(glUniformMatrix4fv(Bright_up.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Bright_down);
-    GL_CHECK(glUniformMatrix4fv(Bright_down.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Bleft_up);
-    GL_CHECK(glUniformMatrix4fv(Bleft_up.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Bleft_down);
-    GL_CHECK(glUniformMatrix4fv(Bleft_down.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, BCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Tfront_right);
-    GL_CHECK(glUniformMatrix4fv(Tfront_right.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, TCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Tfront_left);
-    GL_CHECK(glUniformMatrix4fv(Tfront_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, TCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Tback_right);
-    GL_CHECK(glUniformMatrix4fv(Tback_right.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, TCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&Tback_left);
-    GL_CHECK(glUniformMatrix4fv(Tback_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, TCL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&top_front);
-    GL_CHECK(glUniformMatrix4fv(top_front.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, TFBL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&top_back);
-    GL_CHECK(glUniformMatrix4fv(top_back.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, TFBL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&top_right);
-    GL_CHECK(glUniformMatrix4fv(top_right.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, TLRL_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_line_restore_vbo(&top_left);
-    GL_CHECK(glUniformMatrix4fv(top_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP));
-    glDrawElements(GL_LINES, TLRL_index_size, GL_UNSIGNED_SHORT,  0);
-
-	//iXangle += 3;
-	//iYangle += 2;
-	//iZangle += 1;
-
-	//if(iXangle >= 360) iXangle -= 360;
-	//if(iXangle < 0) iXangle += 360;
-	if(iYangle >= 90) iYangle -= 180;
-	if(iYangle < 0) iYangle += 360;
-	//if(iZangle >= 360) iZangle -= 360;
-	//if(iZangle < 0) iZangle += 360;
-
-
-}
-*/
-
-void avm_texture_init()
-{
-    //GLuint TextureID[4];
-
-    BFBT_index_size=FBVslices*2*Cslices*3;
-    BLRT_index_size=LRVslices*2*Cslices*3;
-    BCT_index_size=(Vslices)*2*(Cslices-1)*3+(Vslices)*3;
-
-    TFBT_index_size=FBVslices*2*(Hslices)*3;
-    TLRT_index_size=LRVslices*2*(Hslices)*3;
-    TCT_index_size=(Vslices)*2*(Hslices)*3;
-
-
-#ifdef WISH
-	shader_texture_rotate_init(&bottom_front);
-#else
-    shader_texture_init(&bottom_front);
 #endif
-	vertices_texture_init(&bottom_front,bottom_avm._front, BFB_size, bottom_texture_avm._front, BFB_size/3*2, bottom_tri_avm.front_back, BFBT_index_size);
-
-#ifdef WISH
-	shader_texture_rotate_init(&Bfront_left);
-#else	
-    shader_texture_init(&Bfront_left);
-#endif
-	vertices_texture_init(&Bfront_left,bottom_avm.front_left, BC_size, bottom_texture_avm.front_left, BC_size/3*2, bottom_tri_avm.circle, BCT_index_size);
-
-#ifdef WISH
-	shader_texture_rotate_init(&Bfront_right);
-#else	
-    shader_texture_init(&Bfront_right);
-#endif
-    vertices_texture_init(&Bfront_right,bottom_avm.front_right, BC_size, bottom_texture_avm.front_right, BC_size/3*2, bottom_tri_avm.circle, BCT_index_size);
-
-#ifdef WISH
-	shader_texture_rotate_init(&bottom_back);
-#else	
-    shader_texture_init(&bottom_back);
-#endif
-    vertices_texture_init(&bottom_back,bottom_avm._back, BFB_size, bottom_texture_avm._back, BFB_size/3*2, bottom_tri_avm.front_back, BFBT_index_size);
-
-#ifdef WISH
-	shader_texture_rotate_init(&Bback_left);
-#else	
-    shader_texture_init(&Bback_left);
-#endif
-    vertices_texture_init(&Bback_left,bottom_avm.back_left, BC_size, bottom_texture_avm.back_left, BC_size/3*2, bottom_tri_avm.circle, BCT_index_size);
-
-#ifdef WISH
-	shader_texture_rotate_init(&Bback_right);
-#else	
-    shader_texture_init(&Bback_right);
-#endif
-    vertices_texture_init(&Bback_right,bottom_avm.back_right, BC_size, bottom_texture_avm.back_right, BC_size/3*2, bottom_tri_avm.circle, BCT_index_size);
-
-
-    shader_texture_init(&bottom_left);
-    vertices_texture_init(&bottom_left,bottom_avm.left, BLR_size, bottom_texture_avm.left, BLR_size/3*2, bottom_tri_avm.right_left, BLRT_index_size);
-
-    shader_texture_init(&bottom_right);
-    vertices_texture_init(&bottom_right,bottom_avm.right, BLR_size, bottom_texture_avm.right, BLR_size/3*2, bottom_tri_avm.right_left, BLRT_index_size);
-
-
-#ifdef WISH
-	shader_texture_rotate_init(&top_front);
-#else
-    shader_texture_init(&top_front);
-#endif
-    vertices_texture_init(&top_front,top_avm._front, TFB_size, top_texture_avm._front, TFB_size/3*2, top_tri_avm.front_back, TFBT_index_size);
-
-#ifdef WISH
-	shader_texture_rotate_init(&top_back);
-#else
-    shader_texture_init(&top_back);
-#endif
-    vertices_texture_init(&top_back,top_avm._back, TFB_size, top_texture_avm._back, TFB_size/3*2, top_tri_avm.front_back, TFBT_index_size);
-
-    shader_texture_init(&top_right);
-    vertices_texture_init(&top_right,top_avm.right, TLR_size, top_texture_avm.right, TLR_size/3*2, top_tri_avm.right_left, TLRT_index_size);
-
-    shader_texture_init(&top_left);
-    vertices_texture_init(&top_left,top_avm.left, TLR_size, top_texture_avm.left, TLR_size/3*2, top_tri_avm.right_left, TLRT_index_size);
-
-#ifdef WISH
-	shader_texture_rotate_init(&Tfront_left);
-#else
-    shader_texture_init(&Tfront_left);
-#endif
-    vertices_texture_init(&Tfront_left,top_avm.front_left, TC_size, top_texture_avm.front_left, TC_size/3*2, top_tri_avm.circle, TCT_index_size);
-
-#ifdef WISH
-	shader_texture_rotate_init(&Tfront_right);
-#else
-    shader_texture_init(&Tfront_right);
-#endif
-	vertices_texture_init(&Tfront_right,top_avm.front_right, TC_size, top_texture_avm.front_right, TC_size/3*2, top_tri_avm.circle, TCT_index_size);
-
-#ifdef WISH
-	shader_texture_rotate_init(&Tback_left);
-#else
-    shader_texture_init(&Tback_left);
-#endif
-    vertices_texture_init(&Tback_left,top_avm.back_left, TC_size, top_texture_avm.back_left, TC_size/3*2, top_tri_avm.circle, TCT_index_size);
-
-#ifdef WISH
-	shader_texture_rotate_init(&Tback_right);
-#else
-    shader_texture_init(&Tback_right);
-#endif
-    vertices_texture_init(&Tback_right,top_avm.back_right, TC_size, top_texture_avm.back_right, TC_size/3*2, top_tri_avm.circle, TCT_index_size);
-
-    //******************************overlap region***********************************
-    shader_overlap_init(&Bright_up);
-    vertices_overlap_init(&Bright_up,bottom_avm.right_up, BC_size, bottom_texture_avm.right_up, BC_size/3*2, bottom_tri_avm.circle, BCT_index_size,overlap_alpha.BT_left,BC_size/3);
-
-    shader_overlap_init(&Bright_down);
-    vertices_overlap_init(&Bright_down,bottom_avm.right_down, BC_size, bottom_texture_avm.right_down, BC_size/3*2, bottom_tri_avm.circle, BCT_index_size,overlap_alpha.BT_right,BC_size/3);
-
-    shader_overlap_init(&Bleft_up);
-    vertices_overlap_init(&Bleft_up,bottom_avm.left_up, BC_size, bottom_texture_avm.left_up, BC_size/3*2, bottom_tri_avm.circle, BCT_index_size,overlap_alpha.BT_right,BC_size/3);
-
-    shader_overlap_init(&Bleft_down);
-    vertices_overlap_init(&Bleft_down,bottom_avm.left_down, BC_size, bottom_texture_avm.left_down, BC_size/3*2, bottom_tri_avm.circle, BCT_index_size,overlap_alpha.BT_left,BC_size/3);
-
-    shader_overlap_init(&Tright_up);
-    vertices_overlap_init(&Tright_up,top_avm.right_up, TC_size, top_texture_avm.right_up, TC_size/3*2, top_tri_avm.circle, TCT_index_size, overlap_alpha.TP_right_up,TC_size/3);
-
-    shader_overlap_init(&Tright_down);
-    vertices_overlap_init(&Tright_down,top_avm.right_down, TC_size, top_texture_avm.right_down, TC_size/3*2, top_tri_avm.circle, TCT_index_size, overlap_alpha.TP_right_down,TC_size/3);
-
-    shader_overlap_init(&Tleft_up);
-    vertices_overlap_init(&Tleft_up,top_avm.left_up, TC_size, top_texture_avm.left_up, TC_size/3*2, top_tri_avm.circle, TCT_index_size, overlap_alpha.TP_left_up,TC_size/3);
-    shader_overlap_init(&Tleft_down);
-    vertices_overlap_init(&Tleft_down,top_avm.left_down, TC_size, top_texture_avm.left_down, TC_size/3*2, top_tri_avm.circle, TCT_index_size, overlap_alpha.TP_left_down,TC_size/3);
-
-
-    //******************************overlap region***********************************
-
-    /*glGenTextures(1, &TextureID[0]);
-    GL_CHECK(glGenTextures);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, TextureID[0]);
-    GL_CHECK(glBindTexture);
-    //load_CVimage(TextureID[0], "jeep_outside.bmp");
-
-    glGenTextures(1, &TextureID[1]);
-    GL_CHECK(glGenTextures);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, TextureID[1]);
-    GL_CHECK(glBindTexture);
-    //load_CVimage(TextureID[1], "jeep_outside.bmp");
-
-    glGenTextures(1, &TextureID[2]);
-    GL_CHECK(glGenTextures);
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, TextureID[2]);
-    GL_CHECK(glBindTexture);
-    //load_CVimage(TextureID[2], "jeep_outside.bmp");
-
-    glGenTextures(1, &TextureID[3]);
-    GL_CHECK(glGenTextures);
-    glActiveTexture(GL_TEXTURE3);
-    glBindTexture(GL_TEXTURE_2D, TextureID[3]);
-    GL_CHECK(glBindTexture);
-    //load_CVimage(TextureID[3], "jeep_outside.bmp");
-
-    bottom_front.textureID=Bfront_left.textureID=Bfront_right.textureID=TextureID[0];
-    bottom_right.textureID=Bright_up.textureID=Bright_down.textureID=TextureID[1];
-
-    bottom_back.textureID=Bback_left.textureID=Bback_right.textureID=TextureID[2];
-    bottom_left.textureID=Bleft_up.textureID=Bleft_down.textureID=TextureID[3];
-
-    top_right.textureID=Tright_up.textureID=Tright_down.textureID=TextureID[1];
-    top_left.textureID=Tleft_up.textureID=Tleft_down.textureID=TextureID[3];
-    top_front.textureID=Tfront_right.textureID=Tfront_left.textureID=TextureID[0];
-    top_back.textureID=Tback_right.textureID=Tback_left.textureID=TextureID[2];*/
-
-
-}
-
-
-
-void car_texture_init()
-{
-#ifdef REDFLAG
-
-	GLuint carTexture;
-	GLuint carwhTexture;
-	GLuint carglTexture;
-
-	shader_car_texture_init(&jeep_car);
-	vertices_texture_init(&jeep_car, car_grid, sizeof(car_grid)/sizeof(float), car_texture, sizeof(car_texture)/sizeof(float), car_indexgrid, sizeof(car_indexgrid)/sizeof(short));
-
-	shader_car_texture_init(&jeep_carWH);
-	vertices_texture_init(&jeep_carWH, carwh_grid, sizeof(carwh_grid)/sizeof(float), carwh_texture, sizeof(carwh_texture)/sizeof(float), carwh_indexgrid, sizeof(carwh_indexgrid)/sizeof(short));
-
-	shader_car_texture_init(&jeep_carGL);
-	vertices_texture_init(&jeep_carGL, cargl_grid, sizeof(cargl_grid)/sizeof(float), cargl_texture, sizeof(cargl_texture)/sizeof(float), cargl_indexgrid, sizeof(cargl_indexgrid)/sizeof(short));
-
-	//printf("car_grid: %d \n",sizeof(car_indexgrid)/sizeof(short));
-	glGenTextures(1, &carTexture);
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, carTexture);
-	load_texture_from_raw_file(carTexture, 1024, 1024, GL_RGB,  "/opt/London.bmp");
-	
-	glGenTextures(1, &carwhTexture);
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, carwhTexture);
-	load_texture_from_raw_file(carwhTexture, 512, 512, GL_RGB,  "/opt/LondonWH.bmp");
-
-
-	glGenTextures(1, &carglTexture);
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, carglTexture);
-	load_texture_from_raw_file(carglTexture, 32, 32, GL_RGB,  "/opt/LondonGL.bmp");
-
-
-	jeep_car.textureID = carTexture;
-	jeep_carWH.textureID = carwhTexture;
-	jeep_carGL.textureID = carglTexture;
-	
-	jeep_car.car_texture_size = sizeof(car_indexgrid)/sizeof(short);
-	jeep_carWH.car_texture_size = sizeof(carwh_indexgrid)/sizeof(short);
-	jeep_carGL.car_texture_size = sizeof(cargl_indexgrid)/sizeof(short);
-
-
-#else
-
-    GLuint carTexture;
-
-    shader_car_texture_init(&jeep_car);
-    vertices_texture_init(&jeep_car, car_grid, sizeof(car_grid)/sizeof(float), car_texture, sizeof(car_texture)/sizeof(float), car_indexgrid, sizeof(car_indexgrid)/sizeof(short));
-
-    glGenTextures(1, &carTexture);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, carTexture);
-	load_texture_from_raw_file(carTexture, 512, 512, GL_RGB,  "/opt/jeep1.bmp");
-
-    jeep_car.textureID = carTexture;
-	jeep_car.car_texture_size = sizeof(car_indexgrid)/sizeof(short);
-
-#endif
-}
-
-
-

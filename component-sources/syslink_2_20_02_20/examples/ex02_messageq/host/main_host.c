@@ -49,6 +49,16 @@
 #include "IviTypedef.h"//liuxu, 02/12/2014, for "IviGetTime()".
 
 
+//#define INPUT_PAR "MP4Enc.cfg"
+//#define MPEG4_ENCODER//liuxu, 8/21/2013, enable this mpeg4 encoder function.
+
+#ifdef MPEG4_ENCODER
+#include <pthread.h>//liuxu, 12/19/2013, creat a seperated thread for mpeg4 encoding.
+#include "MP4VEncSP.h"
+#include "ParaParser.h"
+#include "IviTypedef.h"
+#include "IviReturn.h"
+#endif 
 /* package header files */
 #include <ti/syslink/Std.h>     /* must be first */
 #include <ti/syslink/IpcHost.h>
@@ -71,10 +81,8 @@
 #include "App.h"
 
 #define GFX_CUBE//liuxu, 8/28/2013, enable GFX demo, which should be enabled exclusively with MP4 encoder. 
-#include <GLES2/gl2.h>
-#include <EGL/egl.h>
-#include <GLES2/gl2ext.h>
 
+#ifdef GFX_CUBE
 #include <sys/ioctl.h>
 //#include <fcntl.h>//liuxu, 12/19/2013, move to outside.
 #include <sys/mman.h>
@@ -85,26 +93,35 @@
 #include <bc_cat.h>
 #include "common.h"
 
-// for 一汽紅旗
-#define REDFLAG
-
-
 // + a0220402, add support carit board key
 #define CONFIG_CARIT
 // - a0220402,
 
 #define NO_MEMCPY//liuxu, 10/10/2013.
 
-//liuxu, 10/12/2013, option 2, use one of 4 frames to constitute to a texture buffer at size of 736x480x1.5 for YUV420.
+#ifdef NO_MEMCPY
+
+#if 0//liuxu, 10/12/2013, option 1, 4 frames are combined to one big texture buffer.
+#define FRAME_WIDTH     736*2
+#define FRAME_HEIGHT    480*2
+#define FRAME_SIZE      736*480*6//liuxu, 9/7/2013. (FRAME_WIDTH * FRAME_HEIGHT * 1.5)
+#define MAX_FRAMES      6
+#define YUV_PIXEL_FMT   BC_PIX_FMT_NV12
+#define MAX_BUFFERS     6
+#else //liuxu, 10/12/2013, option 2, use one of 4 frames to constitute to a texture buffer at size of 736x480x1.5 for YUV420.
 #define FRAME_WIDTH     736
 #define FRAME_HEIGHT    480
 #define FRAME_SIZE      736*480*3/2//liuxu, 9/7/2013. (FRAME_WIDTH * FRAME_HEIGHT * 1.5)
 
-
+#ifdef TI_DSP_PROCESSING
+#define MAX_FRAMES      25//liuxu, 02/12/2014, add one for outputbuf of ti dsp. 
+#define YUV_PIXEL_FMT   BC_PIX_FMT_NV12
+#define MAX_BUFFERS     25
+#else
 #define MAX_FRAMES      24//liuxu, 10/18/2013.
 #define YUV_PIXEL_FMT   BC_PIX_FMT_NV12
 #define MAX_BUFFERS     24//liuxu, 10/18/2013.
-
+#endif
 
 #define InterChannelIndexOffset 6//liuxu, 10/18/2013, to support 4 channels.
 
@@ -115,6 +132,19 @@
 #define M3_FRAMEBUFFER_PA_4 0x844820c0
 #define M3_FRAMEBUFFER_PA_5 0x846878c0//liuxu, 02/12/2014. 
 
+#endif
+
+#else
+#define FRAME_WIDTH     720
+#define FRAME_HEIGHT    480
+#define FRAME_SIZE      518400//liuxu, 9/7/2013. (FRAME_WIDTH * FRAME_HEIGHT * 1.5)
+#define MAX_FRAMES      3//liuxu, 9/7/2013, help to deal with low mem???
+#define YUV_PIXEL_FMT   BC_PIX_FMT_NV12
+#define MAX_BUFFERS     3
+
+#define InterChannelIndexOffset 6//liuxu, 10/18/2013, to support 4 channels.
+#endif
+
 
 static char *frame[MAX_FRAMES];
 static char *yuv_data = NULL;
@@ -122,29 +152,49 @@ static int   fr_idx = 0;
 static int   bcdev_id = 0;
 static tex_buffer_info_t buf_info;
 
-/* 3D AVM */
-int    texChYuv[4] = {0};  //0:前 1:左 2:右 3:後
-void avm_drawtexture_VBO(int bufferfront,int bufferright,int bufferleft,int bufferback);
-void car_drawtexture_VBO();
-
-
-int Enforcement3DAVM = 1; //強迫開機進入3DAVM
-
-
 int frame_init(bc_buf_params_t *p)
 {
     int   ii;
+#if 0//liuxu, 9/7/2013, use pointers from M3 through MMU. 
+    yuv_data = malloc(FRAME_SIZE * MAX_FRAMES);
+    if (yuv_data == NULL) {
+        fprintf(stdout, "no enough memory for input file\n");
+        return -1;
+    }
+
+    for (ii = 0; ii < MAX_FRAMES; ii++) {
+        frame[ii] = &yuv_data[ii * FRAME_SIZE];
+    }
+#endif 
     if (p) {
         p->count = MAX_FRAMES;
         p->width = FRAME_WIDTH;
         p->height = FRAME_HEIGHT;
         p->fourcc = YUV_PIXEL_FMT;
+
+#ifdef NO_MEMCPY
         p->type = BC_MEMORY_USERPTR;//liuxu, 10/10/2013.
+#else
+        p->type = BC_MEMORY_MMAP;
+#endif
+
     }
+
     return 0;
 }
 
+char *frame_get(bc_buf_ptr_t *p)
+{
+    char *va;
+    va = frame[fr_idx];
+    pattern_uyvy(fr_idx, va, FRAME_WIDTH, FRAME_HEIGHT);
+    fr_idx = (fr_idx + 1) % MAX_FRAMES;
 
+    if (p)
+        p->pa = 0;
+
+    return va;
+}
 
 void frame_cleanup(void)
 {
@@ -153,6 +203,204 @@ void frame_cleanup(void)
 }
 
 
+#ifdef GLES_20
+void drawCube(int bufferindex, int sidebufferindex)//liuxu, 06/02/2014, add second parameter for side view select.
+{
+    static float rot_x = 0.0;
+    static float rot_y = 0.0;
+    float sx, cx, sy, cy;
+    int tex_sampler;
+
+
+#if 1    
+    /* rotate the cube */
+    sx = sin(rot_x);
+    cx = cos(rot_x);
+    sy = sin(rot_y);
+    cy = cos(rot_y);
+#else//liuxu, 10/12/2013, disable rotation because of floating point performance issue.
+    /* rotate the cube */
+    sx = (rot_x);
+    cx = (rot_x);
+    sy = (rot_y);
+    cy = (rot_y);
+#endif   
+
+#ifndef DIRECT_SHOW//liuxu, 02/16/2014.
+
+    modelview[0] = cy;
+    modelview[1] = 0;
+    modelview[2] = -sy;
+    modelview[4] = sy * sy;
+    modelview[5] = cx;
+    modelview[6] = cy * sx;
+    modelview[8] = sy * cx;
+    modelview[9] = -sx;
+    modelview[10] = cx * cy;
+#endif   
+
+
+    glClearColor (0.0, 0.0, 0.0, 1.0);
+
+    
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+
+
+#ifndef DIRECT_SHOW
+
+    glUseProgram(program[0]);
+   
+    glUniformMatrix4fv(model_view_idx[0], 1, GL_FALSE, modelview);
+    glUniformMatrix4fv(proj_idx[0], 1, GL_FALSE, projection);
+
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 8);
+    glDrawArrays(GL_TRIANGLE_STRIP, 8, 8);
+#endif
+
+
+    /* associate the stream texture */
+    tex_sampler = glGetUniformLocation(program[1], "streamtexture");
+
+
+
+    glUseProgram(program[1]);
+
+
+    if (ptex_objs) {
+
+    
+        /* activate texture unit */
+        glActiveTexture(GL_TEXTURE0);
+
+
+        
+        glBindTexture(GL_TEXTURE_STREAM_IMG, ptex_objs[bufferindex]);
+
+   
+        /* associate the sampler to a texture unit
+         * 0 matches GL_TEXTURE0 */
+        glUniform1i(tex_sampler, 0);
+   
+        glUniformMatrix4fv(model_view_idx[1], 1, GL_FALSE, modelview);
+        glUniformMatrix4fv(proj_idx[1], 1, GL_FALSE, projection);
+
+
+#ifndef DIRECT_SHOW
+
+        glDrawArrays (GL_TRIANGLE_STRIP, 0, 8);
+        glDrawArrays (GL_TRIANGLE_STRIP, 8, 8);
+#else
+
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, cube_vertices);
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, cube_tex_coords);
+        glUniformMatrix4fv(model_view_idx[1], 1, GL_FALSE, modelview);
+
+        glDrawArrays (GL_TRIANGLES, 0, 6);//liuxu, 02/16/2014.//liuxu, 06/03/2014, disable the gfx0 pipeline in run-time will block this function under flip mode...RISK...
+//printf("\n14\n");
+        #ifdef SIDE_VIEW//liuxu, 06/02/2014.
+        glBindTexture(GL_TEXTURE_STREAM_IMG, ptex_objs[sidebufferindex]);
+        glDrawArrays (GL_TRIANGLES, 6, 6);//liuxu, 02/16/2014.
+        #endif
+
+        //sleep(1);
+
+        //glFinish();//liuxu, 02/19/2014.
+
+        #ifdef TINY_CUBE//liuxu, 02/18/2014.
+
+        #define MY_DISPLAY_WIDTH (704.0)//liuxu, 04/21/2014, change from 720 to 704 due to "eglCreateWindowSurface" can not work under 720/32=22.5.
+        #define MY_DISPLAY_HEIGHT (480.0)
+        #define TINY_CUBE_LINE (90.0)
+
+        float my_ratio1 = TINY_CUBE_LINE/MY_DISPLAY_HEIGHT;
+        float my_ratio2 = MY_DISPLAY_HEIGHT/MY_DISPLAY_WIDTH;
+
+        
+        modelview_tiny[0] = cy*my_ratio1*my_ratio2;
+        modelview_tiny[1] = 0;
+        modelview_tiny[2] = -sy*my_ratio1;
+        modelview_tiny[4] = sy * sy*my_ratio1*my_ratio2;
+        modelview_tiny[5] = cx*my_ratio1;
+        modelview_tiny[6] = cy * sx*my_ratio1;
+        modelview_tiny[8] = sy * cx*my_ratio1*my_ratio2;
+        modelview_tiny[9] = -sx*my_ratio1;
+        modelview_tiny[10] = cx * cy*my_ratio1;
+
+
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, cube_vertices_tiny);
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, cube_tex_coords_tiny);
+
+        glUniformMatrix4fv(model_view_idx[1], 1, GL_FALSE, modelview_tiny);
+
+        glDrawArrays (GL_TRIANGLE_STRIP, 0, 8);
+        glDrawArrays (GL_TRIANGLE_STRIP, 8, 8);
+
+        rot_x += 0.01;
+        rot_y += 0.01;
+
+        //sleep(1);
+
+
+        #endif
+#endif
+
+    }
+
+    eglSwapBuffers(dpy, surface);
+
+
+    
+#ifndef DIRECT_SHOW
+    rot_x += 0.01;
+    rot_y += 0.01;
+#endif
+
+}
+#else
+
+void drawCube(int bufferindex)
+{
+    static GLfloat m_fAngleX = 0.0f;
+    static GLfloat m_fAngleY = 0.0f;
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glEnable(GL_TEXTURE_STREAM_IMG);
+
+    glPushMatrix();
+
+    // Rotate the cube model
+    glRotatef(m_fAngleX, 1.0f, 0.0f, 0.0f);
+    glRotatef(m_fAngleY, 0.0f, 1.0f, 0.0f);
+
+    glTexBindStreamIMG(bcdev_id, bufferindex);
+/*    glBindTexture(GL_TEXTURE_STREAM_IMG, bufferindex);*/
+
+    // Enable 3 types of data
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_NORMAL_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+
+    // Set pointers to the arrays
+    glVertexPointer(3, GL_FLOAT, 0, cube_vertices);
+    glNormalPointer(GL_FLOAT, 0, cube_normals);
+    glTexCoordPointer(2, GL_FLOAT, 0, cube_tex_coords);
+
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 8);
+    glDrawArrays(GL_TRIANGLE_STRIP, 8, 8);
+
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisableClientState(GL_NORMAL_ARRAY);
+
+    glPopMatrix();
+
+    glDisable(GL_TEXTURE_STREAM_IMG);
+    eglSwapBuffers(dpy, surface);
+
+    m_fAngleX += 0.25f;
+    m_fAngleY += 0.25f;
+}
+#endif
 
 void usage(char *arg)
 {
@@ -167,6 +415,7 @@ void usage(char *arg)
 }
 
 
+#endif 
 
 /* private functions */
 static Int Main_main(Void);
@@ -206,14 +455,20 @@ Int main(Int argc, Char* argv[])
     Int status;
     
     printf("--> liuxu, main:, curTrace=0x%x\n", curTrace);
-
-	printf("\r\n********************AUTORAD*******************main\n");    
-	printf("\r\n********************AUTORAD*******************main\n");    
-	printf("\r\n********************AUTORAD*******************main\n");  
+    
     //test111();
 
+#if 0//liuxu, 8/19/2013.    
+    /* parse command line */
+    status = Main_parseArgs(argc, argv);
+
+    if (status < 0) {
+        goto leave;
+    }
+#endif
 
     GT_setTrace ((GT_TraceState_Enable | GT_TraceSetFailure_Enable | (4 << (32 - GT_TRACECLASS_SHIFT))), GT_TraceType_User);//liuxu, 8/19/2013, enable trace.
+
 
     /* SysLink initialization */
     SysLink_setup();
@@ -292,10 +547,89 @@ Int32 commandQGet(void *hCmdQ, void *ppMsg, UInt32 nTimeOut)
     return (MessageQ_get((MessageQ_Handle) hCmdQ, (MessageQ_Msg *) ppMsg, nTimeOut));
 }
 
-
-
+#ifdef MPEG4_ENCODER
 #include <ti/syslink/ProcMgr.h>
+void * pEncoder = NULL;
+FRAME_STRUCT InputFrame;
 
+unsigned int writeIdx = 0;
+unsigned int readIdx = 0;
+
+ivi8u* video_Y_PointerFifo[4]={NULL};
+ivi8u* video_UV_PointerFifo[4]={NULL};
+
+//#define ONE_THREAD_TEST//liuxu, 12/23/2013, just for test.
+
+void mpeg4_encoding_task(void)
+{
+
+    int k = 0;
+    int time1, time2;
+    int sum_time = 0;
+
+    printf("\n\n\n\n\n\n\n\n\n\nliuxu, mpeg4_encoding_task\n\n\n\n\n\n\n\n\n\n");
+
+    while(1)
+    {
+
+        if(writeIdx > readIdx)
+        {
+            k++;
+
+            printf("\nliuxu, readIdx = %d in mpeg4_encoding_task", readIdx);
+        
+        	InputFrame.pY = video_Y_PointerFifo[readIdx%4];//pInputYUV + alignoffset;
+        	InputFrame.pU = video_UV_PointerFifo[readIdx%4];//InputFrame.pY + lumalen;
+        	InputFrame.pV = NULL;//InputFrame.pU + chromalen;//liuxu, 8/21/2013, just two points for NV12.
+
+#ifndef ONE_THREAD_TEST//liuxu, 12/23/2013, just for test.
+        	readIdx++;
+#endif
+        	InputFrame.TimeStamp = k;		// time stamp!
+    		InputFrame.userDoNotEncode = iviFalse;		// encode this frame!
+    		
+    		//If the user decides to drop the frame, then no matter what rc has decided the frame will be dropped.
+    		if (InputFrame.userDoNotEncode)
+    			InputFrame.DoNotEncode = InputFrame.userDoNotEncode;
+    		
+    		time1 = IviGetTime();
+
+    		if ( FAILED(MP4VEncSP_EncodeFrame(pEncoder, &InputFrame)) )
+    		{
+    		    printf("\nliuxu, MP4VEncSP_EncodeFrame Failed!!\n");
+    		}
+
+    		time2 = IviGetTime() - time1;
+
+            printf("\nliuxu, k=%d, encoding per frame=%d-ms", k, time2);
+
+    		
+    		sum_time += time2;
+
+    		if(k == 1200)
+    		{
+                //printf("\nliuxu, k=%d, pointerY=0x%x, pointerUV=0x%x, pFrom_DSP_TempCmdMsg->pY_Pointer0=0x%x, pFrom_DSP_TempCmdMsg->pUV_Pointer0=0x%x\n", k, vitrualY, vitrualUV, pFrom_DSP_TempCmdMsg->pY_Pointer0, pFrom_DSP_TempCmdMsg->pUV_Pointer0);
+                printf("liuxu, timestamp=%d, Average FPS is %f!\n", time1+time2, 1200 * 1000.0 / sum_time);
+
+                while(1)
+                {
+                    sleep(5000);//liuxu, 12/24/2013, sleep 5000s. 
+                }
+
+    		}
+
+        }
+        else
+        {
+            ;//usleep(10000);//liuxu, 12/23/2013, usleep 20ms to yield to mpeg4 encoder thread. 
+        }
+	}
+}
+#endif
+
+#ifdef GFX_CUBE
+#include <ti/syslink/ProcMgr.h>
+#endif
 
 #define SAVE_PERSMAT_TO_FS//liuxu, 04/24/2014.
 
@@ -327,6 +661,53 @@ Int Main_main(Void)
     printf("--> Main_main:\n");
 
 
+#ifdef SAVE_PERSMAT_TO_FS
+
+        unsigned char *coreObjVirtBaseAddr2;
+
+        unsigned int memDevFd2;
+        memDevFd2 = open("/dev/mem",O_RDWR|O_SYNC);
+        if(memDevFd2 < 0)
+        {
+            printf("\nliuxu, 04/24/2014, ERROR: /dev/mem open failed for load!!!\n");
+            return -1;
+        }
+
+        coreObjVirtBaseAddr2 = mmap(
+                (void	*)0x80000000,
+                0x1000,
+				PROT_READ|PROT_WRITE|PROT_EXEC,
+				MAP_SHARED,
+				memDevFd2,
+				0x80000000
+				);
+
+		if (coreObjVirtBaseAddr2 == NULL)
+    	{
+    		printf("\nliuxu, 04/24/2014, ERROR: mmap() failed for load!!!\n");
+    		return -1;
+    	}
+
+        *((unsigned int *)coreObjVirtBaseAddr2) = 0xFFFFFFFF;//liuxu, 04/24/2014, clear to tag in case no exsiting persmat.dat, so that the DSP use the one built in code.
+          
+        FILE * dumpfilePersmat_ForLoad;
+
+        dumpfilePersmat_ForLoad = fopen("/media/mmcblk0p1/DSP_Persmat.dat", "r");//liuxu, 04/24/2014, just failed if no exsiting.
+
+            
+        if(dumpfilePersmat_ForLoad == NULL)
+        {
+            printf("\nliuxu, 04/24/2014, /media/mmcblk0p1/DSP_Persmat.dat doesn't exist\n");
+        }
+        else
+        {
+            int i_readPersmatcount = fread (coreObjVirtBaseAddr2, 1, 4*9*4, dumpfilePersmat_ForLoad);
+            printf("\nliuxu, 04/22/2014, i_readPersmatcount=%d bytes\n", i_readPersmatcount);
+            fclose(dumpfilePersmat_ForLoad);
+            close(memDevFd2);
+        }
+#endif
+
     remoteProcId = MultiProc_getId("DSP");
 
     /* attach to the remote processor */
@@ -337,8 +718,11 @@ Int Main_main(Void)
 
     void *ipc_vector = (0x85c00400);//liuxu, 07/01/2014, this is the address of ipc header.
 
+    #if 1
     status = Ipc_control(remoteProcId, Ipc_CONTROLCMD_LOADCALLBACK, &ipc_vector);//liuxu, 07/01/2014, support late attach. 
-
+    #else
+    status = Ipc_control(remoteProcId, Ipc_CONTROLCMD_LOADCALLBACK, NULL);
+    #endif
     
     if (status < 0) {
         printf("Main_main: load callback failed, remoteProcId=%d\n", remoteProcId);
@@ -392,17 +776,14 @@ Int Main_main(Void)
     int long_press_counter = 0;
     int long_pressed_trigger = 0;
 
-
-
-#ifdef REDFLAG
-    int ChInfoToDSP = 6;
-#else
-	int ChInfoToDSP = 0;
-#endif
+    int ChInfoToDSP = 0;
 
 // + a0220402, add support carit board key
-    fd_gpio = open("/sys/class/gpio/gpio3/value", O_RDONLY | O_NONBLOCK );
-
+#ifdef CONFIG_CARIT
+    fd_gpio = open("/sys/class/gpio/gpio4/value", O_RDONLY | O_NONBLOCK );
+#else
+    fd_gpio = open("/sys/class/gpio/gpio39/value", O_RDONLY | O_NONBLOCK );//liuxu, 10/18/2013, for detecting sw9 of J5eco EVM.
+#endif
 // - a0220402,
 	if (fd_gpio < 0) {
 		perror("\nliuxu, gpio/fd_open\n");
@@ -484,12 +865,10 @@ Int Main_main(Void)
 //+ a0220402, R1.1 add protection for the case of the absence of SD card
 	if( dumpfile0 == NULL ) {
 		printf ("SD card is needed for snopshot for developing!\n");
-	}
-	else
-	{ 
+	}else{ 
 	
-		dumpfile1 = fopen("/media/mmcblk0p1/TI_right.yuv", "w");
-		dumpfile2 = fopen("/media/mmcblk0p1/TI_left.yuv", "w");
+	dumpfile1 = fopen("/media/mmcblk0p1/TI_right.yuv", "w");
+	dumpfile2 = fopen("/media/mmcblk0p1/TI_left.yuv", "w");
         dumpfile3 = fopen("/media/mmcblk0p1/TI_back.yuv", "w");
 
         time1_profile = IviGetTime();
@@ -534,10 +913,91 @@ Int Main_main(Void)
             }    
 */
     
+#ifdef MPEG4_ENCODER
 
+    static const int alignment = 32;		// cache line alignment!
+	unsigned int alignoffset, lumalen, chromalen;
+	unsigned char *pInputYUV;
+
+	MP4VEncSP_OpenOptions OpenOptions;
+	ENC_STATUS EncStatus;
+	FILE *parfile, *rawfile;
+	FILE *resultFile;
+
+	parfile = fopen("./mp4enc.cfg", "r");
+
+	if ( !parfile ) {
+		printf ("Can't open input Par file!\n");
+		return -1;
+	}
+
+	resultFile = fopen("MP4EncPerf.txt", "wt");
+
+	if ( !resultFile ) {
+		printf ("Can't open performance result file!\n");
+		return -1;
+	}
+
+	memset(&OpenOptions, sizeof(MP4VEncSP_OpenOptions),0);
+
+	Get_MPEG4Par_File (&OpenOptions, parfile);
+
+	ConfigureStandardPar_MPEG4(&OpenOptions);
+
+
+    if ( FAILED(MP4VEncSP_Create(&pEncoder)) )
+	    return -1;
+
+
+    if( FAILED(MP4VEncSP_Open(pEncoder, &OpenOptions)) )
+	    return -1;
+
+     //The first frame will always be encoded. 
+	InputFrame.DoNotEncode = iviFalse;		// encode this frame!
+	
+	InputFrame.SrcEncodeRate = OpenOptions.iSrcEncodeRate;
+	InputFrame.FrameType = OpenOptions.iColorFormat;			// input frame type, not support RGB565 yet
+
+    InputFrame.YStride = OpenOptions.iFrameWidth + 16;//liuxu, 10/17/2013, support for stride.
+	InputFrame.UVStride = (InputFrame.FrameType==NV12) ? (InputFrame.YStride):(InputFrame.YStride>>1);
+    lumalen = (OpenOptions.iFrameWidth + 16) * OpenOptions.iFrameHeight;
+	
+	chromalen = (InputFrame.FrameType == YUV422) ? (lumalen>>1) : (lumalen>>2);
+
+	ProcMgr_Handle handle = NULL;//liuxu, 10/17/2013, moved from do-while, otherwise the first frame would be slow and pipeline was breaked.
+
+	status = ProcMgr_open (&handle, 0);
+
+	//printf("\nliuxu, ProcMgr_open successful, handle=0x%x\n", handle);//liuxuliuxu.
+
+
+	if (status < 0)
+    {
+        printf("\nliuxu, ProcMgr_open error, status=0x%x\n", status);//liuxuliuxu.
+        while(1);
+    }
+    
+    pthread_t thread_id;
+    int err; 
+
+#if 1//liuxu, 12/24/2013     
+    err = pthread_create (&thread_id, NULL, mpeg4_encoding_task, NULL);
+
+    if (err != 0)
+    {
+        printf("\n\n\nliuxu, can't create thread: %s\n", strerror(err));
+
+        while(1);
+    }
+
+    printf("\n\n\nliuxu, thread_id = %d\n", thread_id);
+#endif
+
+
+#endif
 
     //printf("\nliuxu, start, timestamp=%d!!!!\n", IviGetTime());//liuxuliuxu.
-
+#ifdef GFX_CUBE
         int bcfd = -1; 
         char bcdev_name[] = "/dev/bccatX";
         BCIO_package ioctl_var;
@@ -582,12 +1042,26 @@ Int Main_main(Void)
         if (min_h > 0)
             buf_param.height = min_h;
 
-//printf("\n-->liuxu, 06/19/2014, frame_w=%d, frame_h=%d, min_w=%d, min_h=%d", frame_w, frame_h, min_w, min_h);
-//736 480 0 0
+printf("\n-->liuxu, 06/19/2014, frame_w=%d, frame_h=%d, min_w=%d, min_h=%d", frame_w, frame_h, min_w, min_h);
 
         int check = 0;
 
+#ifndef NO_MEMCPY
+        if ((check = ioctl(bcfd, BCIOREQ_BUFFERS, &buf_param)) != 0) {
+            printf("ERROR: BCIOREQ_BUFFERS failed, check=%d\n", check);
+            goto err_ret;
+        }
 
+        if (ioctl(bcfd, BCIOGET_BUFFERCOUNT, &ioctl_var) != 0) {
+            goto err_ret;
+        }
+
+
+        if (ioctl_var.output == 0) {
+            printf("ERROR: no texture buffer available\n");
+            goto err_ret;
+        }
+#else
         if ((check = ioctl(bcfd, BCIOREQ_BUFFERS, &buf_param)) != 0) {
             printf("ERROR: BCIOREQ_BUFFERS failed, check=%d\n", check);
             goto err_ret;
@@ -791,15 +1265,22 @@ Int Main_main(Void)
             return -1;
         }
 
+        #ifdef TI_DSP_PROCESSING
+        buf_pa_init.pa = 0x8ff00000;//liuxu, 02/12/2014, add one/idx24 for outputbuf of ti dsp processing, hard coding. 
+        buf_pa_init.index = 24;
+        if (ioctl(bcfd, BCIOSET_BUFFERPHYADDR, &buf_pa_init) != 0)
+        {
+            printf("\nliuxu, ERROR: BCIOSET_BUFFERPHYADDR error, %d, 0x%lx\n", buf_pa_init.index, buf_pa_init.pa);
+            return -1;
+        }
+        #endif
+
+#endif
 
         if (initEGL(ioctl_var.output)) {
             printf("ERROR: init EGL failed\n");
             goto err_ret;
         }
-		//printf("\n *************3D AVM bcdev_id = %d\n", bcdev_id);  
-		//bcdev_id=0		
-		//printf("\n *************3D AVM buf_info.n = %d, buf_info.w = %d, buf_info.h = %d, buf_info.fmt = %d\n", buf_info.n ,buf_info.w, buf_info.h, buf_info.fmt);		
-		//0 0 0 0
 
         if ((ret = initTexExt(bcdev_id, &buf_info)) < 0) {
             printf("ERROR: initTexExt() failed [%d]\n", ret);
@@ -811,12 +1292,7 @@ Int Main_main(Void)
             goto err_ret;
         }
 
-//printf("\n--> liuxu buf number 10/12/2013, buf_info.n=%d\n", buf_info.n); 
-//24
-//		render3DSRVObj.screen_width = FRAME_WIDTH;
-//		render3DSRVObj.screen_height = FRAME_HEIGHT;	
-//		status = SgxRender3DSRV_setup(&render3DSRVObj);
-
+printf("\n--> liuxu buf number 10/12/2013, buf_info.n=%d\n", buf_info.n);
 
         /*FIXME calc stride instead of 2*/
         buf_size = buf_info.w * buf_info.h * 1.5;//liuxu, 9/7/2013. ?????
@@ -860,58 +1336,78 @@ printf("\n\n\n--> liuxu checkpoint, cp_offset=%d 10/12/2013\n\n\n", cp_offset);
 
         ret = 0;
         idx = 0;
-
+#endif
 
     int i_put = 0;
     int i_get = 0;
-
-	//OVAL view point initial
-	//camera position
-    float eye_x = -50.0;  
-    float eye_y = 0.0;
-    float eye_z = 60.0;
-    float angle_eye = PI*3/2;  
-    float radious_eye = 50.0;
-	//look direction
-    float center_x = 15.0;
-    float center_y = 0.0;
-    float center_z = 3.0;
-    float radious_cen = 15.0;
-	float angle_cen = PI/2;    //angle_cen-PI
-	//delay time
-    int view_counter = 0;
-	//camera normal line
-    float normal_x = 0.0;
-    float normal_y = 0.0;
-    float normal_z = 1.0;
-
- 	int ViewMode = 0;  //0: topview  1:circle view
- 	int circleCount = 0; //circle要轉幾圈才換回topview
-
-	//topview initial
-	eye_x = 0.0;
-	eye_y = 0.0;
-	eye_z = 180.0;
-	
-	center_x = 0.0;
-	center_y = 0.0;
-	center_z = 0.0;
-
-	
-    do   //****************程式進入點*************
+    
+    do
     {     
 
         time1_profile = IviGetTime();
 
         //printf("\nliuxu, before commandQGet");
 
-		lseek(fd_gpio, 0, SEEK_SET);
+//#ifdef GFX_CUBE//liuxu, 06/19/2014, disable gpu by default.
+        lseek(fd_gpio, 0, SEEK_SET);
         read(fd_gpio, &ch, 1);
-
+//#endif
 
         status = commandQGet(hMessageQ, &(pTempCmdMsg), (UInt32)MessageQ_FOREVER);
 
+#ifdef SAVE_PERSMAT_TO_FS
 
+        static int i_saveFirstTime = 0;
+        if(i_saveFirstTime == 0)
+        {
+            i_saveFirstTime++;
+            FILE * dumpfilePersmat;
+
+            dumpfilePersmat = fopen("/media/mmcblk0p1/DSP_Persmat.dat", "w");//dingding change write folder to SD fat
+
+            if(dumpfilePersmat == NULL)
+            {
+                printf("\nliuxu, 04/24/2014, why creat/write /media/mmcblk0p1/DSP_Persmat.dat failed??\n");
+                return -1;
+            }
+
+            unsigned int memDevFd;
+            memDevFd = open("/dev/mem",O_RDWR|O_SYNC);
+            if(memDevFd < 0)
+            {
+                printf("\nliuxu, 04/24/2014, ERROR: /dev/mem open failed !!!\n");
+                return -1;
+            }
+
+            unsigned char *coreObjVirtBaseAddr;
+            coreObjVirtBaseAddr = mmap(
+	                (void	*)0x80000000,
+	                0x1000,
+					PROT_READ|PROT_WRITE|PROT_EXEC,
+					MAP_SHARED,
+					memDevFd,
+					0x80000000
+					);
+
+			if (coreObjVirtBaseAddr == NULL)
+        	{
+        		printf("\nliuxu, 04/24/2014, ERROR: mmap() failed !!!\n");
+        		return -1;
+        	}
+
+        	int i_writePersmatcount = fwrite(coreObjVirtBaseAddr, 1, 4*9*4, dumpfilePersmat);
+
+        	printf("\nliuxu, 04/22/2014, i_writePersmatcount=%d\n", i_writePersmatcount);
+
+        	fclose(dumpfilePersmat);
+        	close(memDevFd);
+          
+        }
+#endif
+
+        //printf("\nliuxu, after commandQGet");
+
+        
         if (status < 0)
         {
             printf("\nliuxu, commandQGet error, status=0x%x\n", status);//liuxuliuxu.
@@ -946,7 +1442,75 @@ printf("\n\n\n--> liuxu checkpoint, cp_offset=%d 10/12/2013\n\n\n", cp_offset);
         //printf("\nliuxu, k=%d, pointerY=0x%x, pointerUV=0x%x\n", k, pFrom_DSP_TempCmdMsg->pPointer0, pFrom_DSP_TempCmdMsg->pPointer1);
 
 
+#ifdef GFX_CUBE             
         //frame = frame_get(&buf_pa);
+
+#ifndef NO_MEMCPY
+        ProcMgr_Handle               handle = NULL;
+
+    	status = ProcMgr_open (&handle, 0);
+
+    	//printf("\nliuxu, ProcMgr_open successful, handle=0x%x\n", handle);//liuxuliuxu.
+
+
+    	if (status < 0)
+        {
+            printf("\nliuxu, ProcMgr_open error, status=0x%x\n", status);//liuxuliuxu.
+            while(1);
+        }  
+
+
+    	ProcMgr_translateAddr (handle,
+                       &vitrualY,
+                       ProcMgr_AddrType_MasterUsrVirt,
+                       pFrom_DSP_TempCmdMsg->pY_Pointer0,
+                       ProcMgr_AddrType_SlaveVirt);
+
+    	ProcMgr_translateAddr (handle,
+                       &vitrualUV,
+                       ProcMgr_AddrType_MasterUsrVirt,
+                       pFrom_DSP_TempCmdMsg->pUV_Pointer0,
+                       ProcMgr_AddrType_SlaveVirt);
+
+        ProcMgr_translateAddr (handle,
+                       &vitrualY1,
+                       ProcMgr_AddrType_MasterUsrVirt,
+                       pFrom_DSP_TempCmdMsg->pY_Pointer1,
+                       ProcMgr_AddrType_SlaveVirt);
+
+    	ProcMgr_translateAddr (handle,
+                       &vitrualUV1,
+                       ProcMgr_AddrType_MasterUsrVirt,
+                       pFrom_DSP_TempCmdMsg->pUV_Pointer1,
+                       ProcMgr_AddrType_SlaveVirt);
+
+        ProcMgr_translateAddr (handle,
+                       &vitrualY2,
+                       ProcMgr_AddrType_MasterUsrVirt,
+                       pFrom_DSP_TempCmdMsg->pY_Pointer2,
+                       ProcMgr_AddrType_SlaveVirt);
+
+    	ProcMgr_translateAddr (handle,
+                       &vitrualUV2,
+                       ProcMgr_AddrType_MasterUsrVirt,
+                       pFrom_DSP_TempCmdMsg->pUV_Pointer2,
+                       ProcMgr_AddrType_SlaveVirt);
+
+        ProcMgr_translateAddr (handle,
+                       &vitrualY3,
+                       ProcMgr_AddrType_MasterUsrVirt,
+                       pFrom_DSP_TempCmdMsg->pY_Pointer3,
+                       ProcMgr_AddrType_SlaveVirt);
+
+    	ProcMgr_translateAddr (handle,
+                       &vitrualUV3,
+                       ProcMgr_AddrType_MasterUsrVirt,
+                       pFrom_DSP_TempCmdMsg->pUV_Pointer3,
+                       ProcMgr_AddrType_SlaveVirt);
+
+        frame = vitrualY3;//liuxu, 10/5/2013, either 0,1,2,3 can be used here or you can use them together in your app!!!!!!!!
+        frameUV = vitrualUV3;
+#else
 
         if(pFrom_DSP_TempCmdMsg->pY_Pointer0 == M3_FRAMEBUFFER_PA_0)
             idx = 0;
@@ -963,9 +1527,33 @@ printf("\n\n\n--> liuxu checkpoint, cp_offset=%d 10/12/2013\n\n\n", cp_offset);
         else
             idx = 0;;//liuxu, 06/19/2014, here is a RISK...//liuxu, 06/05/2014, test for PAL cam..//printf("\n\nliuxu, error!!!!\n\n");
 
-		//printf("\r\n **************idx:%d************** \n", idx);
-		//會一直輪循 0->1->2->3->4->5->0
+#endif
 
+#ifndef NO_MEMCPY
+        time3_profile = IviGetTime();
+        
+        if (frame == (char *) -1)
+            break;
+
+        if (frame) {
+            if (buf_param.type == BC_MEMORY_MMAP) {
+                for (ii = 0; ii < min_h; ii++)
+                      /*FIXME calc stride instead of 2*/
+                    memcpy(buf_vaddr[idx] + buf_info.w * ii + cp_offset,
+                           frame + 736 * ii, min_w);//liuxu, 9/7/2013.
+
+                for (ii = 0; ii < min_h/2; ii++)
+                    memcpy(buf_info.w * buf_info.h + buf_vaddr[idx] + buf_info.w * ii + cp_offset,
+                           frameUV + 736 * ii, min_w);//liuxu, 9/7/2013, for UV of NV12.
+                
+            }
+            else    /*buf_param.type == BC_MEMORY_USERPTR*/
+                idx = buf_pa.index;
+        }
+
+        time4_profile = IviGetTime() - time3_profile;
+        printf("\nliuxu, memory copy time per frame = %d ms!!", time4_profile);
+#else
         if (buf_param.type == BC_MEMORY_USERPTR) 
         {
             //printf("\nliuxu, 10/10/2013, good, idx=%d!!!\n", idx);
@@ -994,14 +1582,6 @@ printf("\n\n\n--> liuxu checkpoint, cp_offset=%d 10/12/2013\n\n\n", cp_offset);
     	    long_pressed_trigger = 0;
     	}
 
-/* 強制3D AVM
-		if (Enforcement3DAVM==1)
-		{
-			pressing = 1;
-			released = 1;
-			Enforcement3DAVM = 0;
-		}
-*/
     	//printf("\nliuxu, 6/3/2014, ch=%c, pressing=%d, released=%d!!!\n", ch, pressing, released);
         if(long_pressed_trigger == 1)
         {
@@ -1011,40 +1591,71 @@ printf("\n\n\n--> liuxu checkpoint, cp_offset=%d 10/12/2013\n\n\n", cp_offset);
     	    long_pressed_trigger = 0;
 
     	    printf("\nliuxu, 06/03/2014, long pressed triggered\n");
+
+#ifdef SAVE_PERSMAT_TO_FS
+
+            unsigned char *coreObjVirtBaseAddr2;
+
+            unsigned int memDevFd2;
+            memDevFd2 = open("/dev/mem",O_RDWR|O_SYNC);
+            if(memDevFd2 < 0)
+            {
+                printf("\nliuxu, 04/24/2014, ERROR: /dev/mem open failed for load!!!\n");
+                return -1;
+            }
+
+            coreObjVirtBaseAddr2 = mmap(
+                    (void	*)0x80000000,
+                    0x1000,
+    				PROT_READ|PROT_WRITE|PROT_EXEC,
+    				MAP_SHARED,
+    				memDevFd2,
+    				0x80000000
+    				);
+
+    		if (coreObjVirtBaseAddr2 == NULL)
+        	{
+        		printf("\nliuxu, 04/24/2014, ERROR: mmap() failed for load!!!\n");
+        		return -1;
+        	}
+
+            *((unsigned int *)coreObjVirtBaseAddr2) = 0xFFFFFFFF;//liuxu, 04/24/2014, clear to tag in case no exsiting persmat.dat, so that the DSP use the one built in code.
+              
+            FILE * dumpfilePersmat_ForLoad;
+
+            dumpfilePersmat_ForLoad = fopen("/media/mmcblk0p1/DSP_Persmat.dat", "r");//liuxu, 04/24/2014, just failed if no exsiting.
+
+                
+            if(dumpfilePersmat_ForLoad == NULL)
+            {
+                printf("\nliuxu, 06/03/2014, /media/mmcblk0p1/DSP_Persmat.dat doesn't exist, no GA this time\n");
+            }
+            else
+            {
+                int i_readPersmatcount = fread (coreObjVirtBaseAddr2, 1, 4*9*4, dumpfilePersmat_ForLoad);
+                printf("\nliuxu, 06/03/2014, for GA this time, i_readPersmatcount=%d bytes\n", i_readPersmatcount);
+                fclose(dumpfilePersmat_ForLoad);
+                close(memDevFd2);
+
+                *((unsigned int *)(coreObjVirtBaseAddr2 + 0x888)) = 0x88888888;
+                i_saveFirstTime = 0;//liuxu, 06/03/2014, ready for fwrite/saving permat during next frame.
+
+            }
+#endif
         
         }
     	else if((pressing == 1) && (released == 1))//liuxu, 10/18/2013, bug to improve, when rapidly press and release, the behavior may depends by chance.
     	{
-    	    printf("\r\n\n\n\n\n\n\nliuxu, 10/18/2013, a normal key detected!!!\n\n");
+    	    printf("\n\n\n\n\n\n\nliuxu, 10/18/2013, a normal key detected!!!\n\n");
     	    pressing = 0;
     	    released = 0;
 
     	    channelNo++;
     	    channelNo = channelNo%4;
 
-			printf("\r\n **************channelNo:%d************** \n", channelNo);
-			// 哪一路影像
-			
-			
-			ChInfoToDSP++;
-			ChInfoToDSP = ChInfoToDSP%7;//liuxu, 06/20/2014, add two cases for shuffling grx and video pipeline.//liuxu, 06/19/2014, for 5 layouts pattern of DSP and M3.
+    	    ChInfoToDSP++;
+    	    ChInfoToDSP = ChInfoToDSP%7;//liuxu, 06/20/2014, add two cases for shuffling grx and video pipeline.//liuxu, 06/19/2014, for 5 layouts pattern of DSP and M3.
 
-		#ifdef REDFLAG
-			if (ChInfoToDSP == 1)  //skip mode 1-4
-			{ChInfoToDSP = 5;}
-		#endif
-			  
-			printf("\r\n **************ChInfoToDSP:%d************** \n", ChInfoToDSP);
-			//0:  2D AVM  母 + 子
-			//1:  2D AVM  子 + 母
-			//2:  2D AVM  母 + 子
-			//3:  單一全  
-			//4:  四分割
-			//5:  3D Cube (顯示channelNo)
-			//6:  2D AVM  母 + 子
-
-
-		//	ChInfoToDSP = 5; //永遠顯示3D AVM  Enforcement3DAVM=1
     	    if(ChInfoToDSP == 5)
     	    {
     	        system("echo 1,0/0/0/0 > /sys/devices/platform/vpss/display2/order");//liuxu, 06/20/2014, grx0 up.
@@ -1072,93 +1683,100 @@ printf("\n\n\n--> liuxu checkpoint, cp_offset=%d 10/12/2013\n\n\n", cp_offset);
     	    }
     	}
     	//printf("\nliuxu, after drawCube, ch=%d, pressing=%d, released=%d", ch, pressing, released);
+#endif
 
         time3_profile = IviGetTime();
 
+ #ifdef TI_DSP_PROCESSING
 
+        if(idx == 24)
+            drawCube(24, 24);//liuxu, 02/12/2014//liuxu, 06/02/2014, add 2nd parameter for side view.      
+        else
+            drawCube(24, idx+channelNo*InterChannelIndexOffset);//liuxu, 02/12/2014//liuxu, 06/02/2014, add 2nd parameter for side view.
 
-		// 3D mode
-		if(ChInfoToDSP == 5)
-		{
-
-			//texChYuv 編號 CH0(前):0-5  CH1(左):6-11  CH2(右):12-17  CH3(後):18-23  
-			texChYuv[0] = idx + 0 * InterChannelIndexOffset;  //前
-			texChYuv[1] = idx + 1 * InterChannelIndexOffset;  //左
-			texChYuv[2] = idx + 2 * InterChannelIndexOffset;  //右
-			texChYuv[3] = idx + 3 * InterChannelIndexOffset;  //後
-
-
-
-		
-			//畫3D AVM	
-	        camera_LookAt(eye_x, eye_y, eye_z, center_x, center_y, center_z, normal_x, normal_y, normal_z, &aMVP[0]); 
-			car_LookAt(eye_x, eye_y, eye_z, center_x, center_y, center_z, normal_x, normal_y, normal_z, &carMVP[0]);
-	        avm_drawtexture_VBO(texChYuv[0],texChYuv[2],texChYuv[1] ,texChYuv[3]); //放置位置前 右 左 後
-	        car_drawtexture_VBO();
-
-			eglSwapBuffers(dpy, surface);
-	 
-
-			if (ViewMode == 0)
-			{
-				if (eye_z<100)
-				{
-					ViewMode = 1;
-					//OVAL view point initial
-					//camera position
-					eye_x = -50.0;  
-					eye_y = 0.0;
-					eye_z = 60.0;
-					angle_eye = PI*3/2;  
-					//look direction
-					center_x = 15.0;
-					center_y = 0.0;
-					center_z = 3.0;
-					angle_cen = PI/2;    //angle_cen-PI
-					//camera normal line
-					normal_x = 0.0;
-					normal_y = 0.0;
-					normal_z = 1.0;
-				}
-				else
-				{
-					eye_z = eye_z - 0.3;
-					angle_eye = angle_eye + PI/180;
-					normal_x = cos(angle_eye);
-					normal_y = sin(angle_eye);
-				}
-			}
-			else
-			{
-				if (circleCount > 3)
-				{
-					ViewMode = 0;
-					eye_x = 0.0;
-					eye_y = 0.0;
-					eye_z = 180.0;
-					
-					center_x = 0.0;
-					center_y = 0.0;
-					center_z = 0.0;
-					circleCount = 0;
-				}
-				else
-				{
-					//角度旋轉
-					view_Angle_Change(&angle_eye, &angle_cen, &view_counter, &circleCount);
-					eye_x = radious_eye * cos(angle_eye);
-			        eye_y = radious_eye * sin(angle_eye);
-					center_x = radious_cen * cos(angle_cen);
-			        center_y = radious_cen * sin(angle_cen);	
-				}
-			}	
-		}
-
-
-
+ #else
+        drawCube(idx+channelNo*InterChannelIndexOffset, 0);//liuxu, 06/19/2014, snd para is useless when disabled "DIRECT_SHOW" and "SIDE_VIEW"
+ #endif             
         time4_profile = IviGetTime() - time3_profile;
        // printf("\nliuxu, drawCube time per frame = %d ms!!", time4_profile);
         
+#ifndef NO_MEMCPY
+        idx = (idx + 1) % buf_info.n;
+#endif 
+
+#endif
+
+#ifdef MPEG4_ENCODER//liuxu, 8/21/2013, MPEG4 Encoder.
+		
+    	//pInputYUV = (unsigned char *)malloc(sizeof(unsigned char) * (lumalen + chromalen * 2) + alignment);
+    	//alignoffset = alignment - (((unsigned int) pInputYUV) % alignment);
+        
+    	ProcMgr_translateAddr (handle,
+                       &vitrualY,
+                       ProcMgr_AddrType_MasterUsrVirt,
+                       pFrom_DSP_TempCmdMsg->pY_Pointer0,
+                       ProcMgr_AddrType_SlaveVirt);
+
+    	ProcMgr_translateAddr (handle,
+                       &vitrualUV,
+                       ProcMgr_AddrType_MasterUsrVirt,
+                       pFrom_DSP_TempCmdMsg->pUV_Pointer0,
+                       ProcMgr_AddrType_SlaveVirt);
+
+#if 0//liuxu, 12/24/2013. //liuxu, 12/19/2013, move to another thread.
+        static int k = 0;
+        int time1, time2;
+        static int sum_time = 0;
+        
+        k++;
+
+    	
+    	InputFrame.pY = vitrualY;//pInputYUV + alignoffset;
+    	InputFrame.pU = vitrualUV;//InputFrame.pY + lumalen;
+    	InputFrame.pV = NULL;//InputFrame.pU + chromalen;//liuxu, 8/21/2013, just two points for NV12.
+
+    	InputFrame.TimeStamp = k;		// time stamp!
+		InputFrame.userDoNotEncode = iviFalse;		// encode this frame!
+		
+		//If the user decides to drop the frame, then no matter what rc has decided the frame will be dropped.
+		if (InputFrame.userDoNotEncode)
+			InputFrame.DoNotEncode = InputFrame.userDoNotEncode;
+		
+		time1 = IviGetTime();
+
+		if ( FAILED(MP4VEncSP_EncodeFrame(pEncoder, &InputFrame)) )
+		{
+		    printf("\nliuxu, MP4VEncSP_EncodeFrame Failed!!\n");
+		}
+
+		time2 = IviGetTime() - time1;
+
+        printf("\nliuxu, k=%d, encoding per frame=%d-ms", k, time2);
+
+		
+		sum_time += time2;
+
+		if(k == 1200)
+		{
+            printf("\nliuxu, k=%d, pointerY=0x%x, pointerUV=0x%x, pFrom_DSP_TempCmdMsg->pY_Pointer0=0x%x, pFrom_DSP_TempCmdMsg->pUV_Pointer0=0x%x\n", k, vitrualY, vitrualUV, pFrom_DSP_TempCmdMsg->pY_Pointer0, pFrom_DSP_TempCmdMsg->pUV_Pointer0);
+            printf("liuxu, timestamp=%d, Average FPS is %f!\n", time1+time2, 1200 * 1000.0 / sum_time);
+
+            while(1);
+
+		}
+#else
+        video_Y_PointerFifo[writeIdx%4] = vitrualY;
+    	video_UV_PointerFifo[writeIdx%4] = vitrualUV;
+    	writeIdx++;
+    	printf("\nliuxu, 12/19/2013, writeIdx = %d, readIdx = %d!!", writeIdx, readIdx);
+
+#ifdef ONE_THREAD_TEST
+    	sleep(5000);//liuxu, 12/19/2013, this is in unit of second???
+#endif
+
+#endif
+
+#endif
 
 //liuxu, 11/19/2013, ACK to DSP. 
         time6_profile = IviGetTime();
@@ -1196,7 +1814,8 @@ leave:
     
     status = (status >= 0 ? 0 : status);
     return (status);
-   
+
+#ifdef GFX_CUBE    
 err_ret:
         if (buf_param.type == BC_MEMORY_MMAP) {
             for (idx = 0; idx < buf_info.n; idx++) {
@@ -1214,9 +1833,215 @@ err_ret:
 
         printf("liuxu, CUBE done\n");
         return ret;
+#endif
 
 }
 
+#if 0//liuxu, 10/17/2013, quicktest is just a test for 3D cube of color bar.
+Int quicktest_Main_main(Void)
+{
+    UInt16      remoteProcId;
+    Int         status = 0;
+    Int         printremoteProcId = 0xff;
+
+    MessageQ_Msg pTempCmdMsg = NULL;//liuxu, 8/20/2013.
+    UInt16 nSRId = 0u;
+    SharedRegion_SRPtr srPtr = {0u};
+    cfg4Pointers_t *pFrom_DSP_TempCmdMsg = NULL;
+    Int         k = 0;
+
+    unsigned char *vitrualY;
+    unsigned char *vitrualUV;
+     int bcfd = -1; 
+        char bcdev_name[] = "/dev/bccatX";
+        BCIO_package ioctl_var;
+        bc_buf_params_t buf_param;
+        bc_buf_ptr_t buf_pa;
+
+        unsigned long buf_paddr[MAX_BUFFERS];
+        char *buf_vaddr[MAX_BUFFERS] = { MAP_FAILED };
+        char *frame = NULL;
+        int buf_size = 0;
+        int c, idx, ret = -1;
+        char opts[] = "pw:t:b:h";
+
+        int   ii;
+        int   frame_w, frame_h;
+        int   min_w = 0, min_h = 0;;
+        int   cp_offset = 0;
+
+        struct timeval tvp, tv, tv0 = {0,0};
+        unsigned long tdiff = 0;
+        unsigned long fcount = 0;
+    
+
+    printf("--> Main_main:\n");
+    
+
+
+        if (frame_init(&buf_param))
+            return -1;
+
+        bcdev_name[strlen(bcdev_name)-1] = '0' + bcdev_id;
+
+        if ((bcfd = open(bcdev_name, O_RDWR|O_NDELAY)) == -1) {
+            printf("ERROR: open %s failed\n", bcdev_name);
+            goto err_ret;
+        }
+
+        frame_w = buf_param.width;
+        frame_h = buf_param.height;
+
+        if (min_w > 0 && !(min_w % 8))
+            buf_param.width = min_w;
+
+        if (min_h > 0)
+            buf_param.height = min_h;
+     
+        if (ioctl(bcfd, BCIOREQ_BUFFERS, &buf_param) != 0) {
+            printf("ERROR: BCIOREQ_BUFFERS failed\n");
+            goto err_ret;
+        }
+
+        if (ioctl(bcfd, BCIOGET_BUFFERCOUNT, &ioctl_var) != 0) {
+            goto err_ret;
+        }
+
+        if (ioctl_var.output == 0) {
+            printf("ERROR: no texture buffer available\n");
+            goto err_ret;
+        }
+
+        if (initEGL(ioctl_var.output)) {
+            printf("ERROR: init EGL failed\n");
+            goto err_ret;
+        }
+     
+        if ((ret = initTexExt(bcdev_id, &buf_info)) < 0) {
+            printf("ERROR: initTexExt() failed [%d]\n", ret);
+            goto err_ret;
+        }
+
+        if (buf_info.n > MAX_BUFFERS) {
+            printf("ERROR: number of texture buffer exceeds the limit\n");
+            goto err_ret;
+        }
+
+        /*FIXME calc stride instead of 2*/
+        buf_size = buf_info.w * buf_info.h * 2;
+        min_w    = buf_info.w < frame_w ? buf_info.w : frame_w;
+        min_h    = buf_info.h < frame_h ? buf_info.h : frame_h;
+
+        if (buf_info.h > frame_h)
+            cp_offset = (buf_info.h - frame_h) * buf_info.w;
+
+        if (buf_info.w > frame_w)
+            cp_offset += buf_info.w - frame_w;
+
+        if (buf_param.type == BC_MEMORY_MMAP) {
+            for (idx = 0; idx < buf_info.n; idx++) {
+                ioctl_var.input = idx;
+
+                if (ioctl(bcfd, BCIOGET_BUFFERPHYADDR, &ioctl_var) != 0) {
+                    printf("ERROR: BCIOGET_BUFFERADDR failed\n");
+                    goto err_ret;
+                }
+
+                buf_paddr[idx] = ioctl_var.output;
+                buf_vaddr[idx] = (char *)mmap(NULL, buf_size,
+                                  PROT_READ | PROT_WRITE, MAP_SHARED,
+                                  bcfd, buf_paddr[idx]);
+
+                if (buf_vaddr[idx] == MAP_FAILED) {
+                    printf("ERROR: mmap failed\n");
+                    goto err_ret;
+                }
+            }
+        }
+
+        ret = 0;
+        idx = 0;
+
+        if (profiling == TRUE) {
+            gettimeofday(&tvp, NULL);
+            tv0 = tvp;
+        }
+
+        while (!gQuit) 
+        {
+
+#ifdef USE_SOLID_PATTERN
+            usleep(1000 * 1000);
+#endif
+            
+            frame = frame_get(&buf_pa);
+
+            if (frame == (char *) -1)
+                break;
+
+            if (frame) {
+                if (buf_param.type == BC_MEMORY_MMAP) {
+                    for (ii = 0; ii < min_h; ii++)
+                          /*FIXME calc stride instead of 2*/
+                        memcpy(buf_vaddr[idx] + buf_info.w * 2 * ii + cp_offset,
+                               frame + frame_w * 2 * ii, min_w * 2);
+                }
+                else    /*buf_param.type == BC_MEMORY_USERPTR*/
+                    idx = buf_pa.index;
+            }
+
+            drawCube(idx);
+
+            idx = (idx + 1) % buf_info.n;
+
+            if (profiling == FALSE)
+                continue;
+
+            gettimeofday(&tv, NULL);
+
+            fcount++;
+
+            if (!(fcount % 60)) {
+                tdiff = (unsigned long)(tv.tv_sec*1000 + tv.tv_usec/1000 -
+                                    tvp.tv_sec*1000 - tvp.tv_usec/1000);
+                if (tdiff < 1800)   /*print fps every 2 sec*/
+                    continue;
+
+                fprintf(stderr, "\rAvg FPS: %ld",
+                        fcount / (tv.tv_sec - tv0.tv_sec));
+                tvp = tv;
+            }
+
+        }
+
+        printf("\n");
+
+err_ret:
+        if (buf_param.type == BC_MEMORY_MMAP) {
+            for (idx = 0; idx < buf_info.n; idx++) {
+                if (buf_vaddr[idx] != MAP_FAILED)
+                    munmap(buf_vaddr[idx], buf_size);
+            }
+        }
+        if (bcfd > -1)
+            close(bcfd);
+
+        deInitEGL(buf_info.n);
+        frame_cleanup();
+
+        printf("done\n");
+        return ret;
+
+
+       
+
+leave: 
+    printf("<-- Main_main leave:\n");//liuxu, 8/19/2013.
+    
+    status = (status >= 0 ? 0 : status);
+    return (status);
+}
+#endif
 
 /*
  *  ======== Main_parseArgs ========
@@ -1294,315 +2119,3 @@ Int Main_parseArgs(Int argc, Char *argv[])
 leave:
     return(status);
 }
-
-
-
-void avm_drawtexture_VBO(int bufferfront,int bufferright,int bufferleft,int bufferback)
-{
-    int iXangle = 0, iYangle = 0, iZangle = 0;
-    float aRotate[16], aModelView[16], aPerspective[16];
-
-/*
-    rotate_matrix(iXangle, 1.0, 0.0, 0.0, aModelView);
-    rotate_matrix(iYangle, 0.0, 1.0, 0.0, aRotate);
-
-    multiply_matrix(aRotate, aModelView, aModelView);
-
-    rotate_matrix(iZangle, 0.0, 1.0, 0.0, aRotate);
-
-    multiply_matrix(aRotate, aModelView, aModelView);
-
-
-    aModelView[14] -= 40;//2.5
-
-    perspective_matrix(90.0, (double)uiWidth/(double)uiHeight, 0.01, 200.0, aPerspective);
-    multiply_matrix(aPerspective, aModelView, aMVP);*/
-
-
-    //camera_LookAt(50.0, 0.0, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, &aMVP[0]); //不改視點
-
-
-
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-
-
-    avm_texture_restore_vbo(&bottom_front, bufferfront);
-    glUniformMatrix4fv(bottom_front.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BFBT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&Bfront_left, bufferfront);
-    glUniformMatrix4fv(Bfront_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&Bfront_right, bufferfront);
-    glUniformMatrix4fv(Bfront_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&bottom_back, bufferback);
-    glUniformMatrix4fv(bottom_back.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BFBT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&Bback_left, bufferback);
-    glUniformMatrix4fv(Bback_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&Bback_right, bufferback);
-    glUniformMatrix4fv(Bback_right.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&bottom_left, bufferleft);
-    glUniformMatrix4fv(bottom_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BLRT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&bottom_right, bufferright);
-    glUniformMatrix4fv(bottom_right.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BLRT_index_size, GL_UNSIGNED_SHORT,  0);
-
-
-    avm_texture_restore_vbo(&top_right, bufferright);
-    glUniformMatrix4fv(top_right.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TLRT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&top_left, bufferleft);
-    glUniformMatrix4fv(top_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TLRT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&top_front, bufferfront);
-    glUniformMatrix4fv(top_front.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TFBT_index_size, GL_UNSIGNED_SHORT,  0);
-
-
-    avm_texture_restore_vbo(&Tfront_left, bufferfront);
-    glUniformMatrix4fv(Tfront_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&Tfront_right, bufferfront);
-    glUniformMatrix4fv(Tfront_right.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-
-    avm_texture_restore_vbo(&top_back, bufferback);
-    glUniformMatrix4fv(top_back.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TFBT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&Tback_left, bufferback);
-    glUniformMatrix4fv(Tback_left.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_texture_restore_vbo(&Tback_right, bufferback);
-    glUniformMatrix4fv(Tback_right.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-
-    //****************************GL_BLEND start**************************************
-	 glDisable(GL_DEPTH_TEST);
-	 glEnable(GL_BLEND);
-	glBlendEquation(GL_FUNC_ADD);
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-
-	avm_overlap_restore_vbo(&Bright_up, bufferright);
-    glUniformMatrix4fv(Bright_up.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-	avm_overlap_restore_vbo(&Bright_down, bufferright);
-    glUniformMatrix4fv(Bright_down.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_overlap_restore_vbo(&Bleft_up, bufferleft);
-    glUniformMatrix4fv(Bleft_up.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-	avm_overlap_restore_vbo(&Bleft_down, bufferleft);
-    glUniformMatrix4fv(Bleft_down.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, BCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_overlap_restore_vbo(&Tright_up, bufferright);
-    glUniformMatrix4fv(Tright_up.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_overlap_restore_vbo(&Tright_down, bufferright);
-    glUniformMatrix4fv(Tright_down.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_overlap_restore_vbo(&Tleft_up, bufferleft);
-    glUniformMatrix4fv(Tleft_up.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    avm_overlap_restore_vbo(&Tleft_down, bufferleft);
-    glUniformMatrix4fv(Tleft_down.mvMatrixOffsetLoc, 1, GL_FALSE, aMVP);
-    glDrawElements(GL_TRIANGLES, TCT_index_size, GL_UNSIGNED_SHORT,  0);
-
-    glDisable(GL_BLEND);
-    glEnable(GL_DEPTH_TEST);
-
-
-    //****************************GL_BLEND end**************************************
-
-	
-}
-
-
-
-
-void car_drawtexture_VBO()
-{
-    //float aRotate[16], aModelView[16], aPerspective[16];
-
-#ifdef REDFLAG
-
-	avm_car_texture_restore_vbo(&jeep_car, jeep_car.textureID);
-	glUniformMatrix4fv(jeep_car.mvMatrixOffsetLoc, 1, GL_FALSE, carMVP);
-	glDrawElements(GL_TRIANGLES, jeep_car.car_texture_size, GL_UNSIGNED_SHORT,  0);
-
-	avm_car_texture_restore_vbo(&jeep_carWH, jeep_carWH.textureID);
-	glUniformMatrix4fv(jeep_carWH.mvMatrixOffsetLoc, 1, GL_FALSE, carMVP);
-	glDrawElements(GL_TRIANGLES, jeep_carWH.car_texture_size, GL_UNSIGNED_SHORT,	0);
-
-	avm_car_texture_restore_vbo(&jeep_carGL, jeep_carGL.textureID);
-	glUniformMatrix4fv(jeep_carGL.mvMatrixOffsetLoc, 1, GL_FALSE, carMVP);
-	glDrawElements(GL_TRIANGLES, jeep_carGL.car_texture_size, GL_UNSIGNED_SHORT,	0);
-
-
-#else
-	avm_car_texture_restore_vbo(&jeep_car, jeep_car.textureID);
-    glUniformMatrix4fv(jeep_car.mvMatrixOffsetLoc, 1, GL_FALSE, carMVP);
-	glClear(GL_DEPTH_BUFFER_BIT);
-    glDepthFunc(GL_LEQUAL);
-    glEnable(GL_DEPTH_TEST);
-    glDrawElements(GL_TRIANGLES, jeep_car.car_texture_size, GL_UNSIGNED_SHORT,  0);
-	
-#endif
-
-
-
-	
-}
-
-
-
-
-void view_Angle_Change(float *angle_e, float *angle_c, int *view_count, int *circleC)
-{
-	float rotateSpeed =  PI/180;
-	int stoptime = 200;  //1s =20 fps
-	
-	//avoid error and value overflow
-	if (*angle_e > 2*PI)
-	{
-		*angle_e = *angle_e - 2*PI;
-		*circleC = circleC + 1;
-	}
-	if (*angle_c > 2*PI)
-	{
-		*angle_c = *angle_c - 2*PI;
-	}
-
-	//                                                                                                                   ^
-	//set delay time & stop angle   順時針旋轉  0度:-->   ;90度:|    ;180度:<--   ; 270度: |
-	//									       		   V
-#ifdef REDFLAG	
-	if(0)
-	{
-
-	}
-#else
-	if ((*angle_e > 0) && (*angle_e < 0+rotateSpeed))
-	{
-		*view_count = *view_count + 1;
-		if (*view_count == stoptime)
-		{
-			*angle_e = *angle_e + rotateSpeed;
-			*angle_c = *angle_c + rotateSpeed;
-			*view_count = 0;
-		}
-	}
-#endif
-#ifdef REDFLAG	
-	else if ((*angle_e > PI*1/4) && (*angle_e < PI*1/4+rotateSpeed))
-	{
-		*view_count = *view_count + 1;
-		if (*view_count == stoptime)
-		{
-			*angle_e = *angle_e + rotateSpeed;
-			*angle_c = *angle_c + rotateSpeed;
-			*view_count = 0;
-		}
-	}	
-#endif
-	else if ((*angle_e > PI*2/4) && (*angle_e < PI*2/4+rotateSpeed))
-	{
-		*view_count = *view_count + 1;
-		if (*view_count == stoptime)
-		{
-			*angle_e = *angle_e + rotateSpeed;
-			*angle_c = *angle_c + rotateSpeed;
-			*view_count = 0;
-		}
-	}
-#ifdef REDFLAG	
-	else if ((*angle_e > PI*3/4) && (*angle_e < PI*3/4+rotateSpeed))
-	{
-		*view_count = *view_count + 1;
-		if (*view_count == stoptime)
-		{
-			*angle_e = *angle_e + rotateSpeed;
-			*angle_c = *angle_c + rotateSpeed;
-			*view_count = 0;
-		}
-	}	
-#endif	
-#ifdef REDFLAG
-#else
-	else if ((*angle_e > PI*4/4) && (*angle_e < PI*4/4+rotateSpeed))
-	{
-		*view_count = *view_count + 1;
-		if (*view_count == stoptime)
-		{
-			*angle_e = *angle_e + rotateSpeed;
-			*angle_c = *angle_c + rotateSpeed;
-			*view_count = 0;
-		}
-	}
-	else if ((*angle_e > PI*5/4) && (*angle_e < PI*5/4+rotateSpeed))
-	{
-		*view_count = *view_count + 1;
-		if (*view_count == stoptime)
-		{
-			*angle_e = *angle_e + rotateSpeed;
-			*angle_c = *angle_c + rotateSpeed;
-			*view_count = 0;
-		}
-	}
-#endif
-	else if ((*angle_e > PI*6/4) && (*angle_e < PI*6/4+rotateSpeed))
-	{
-		*view_count = *view_count + 1;
-		if (*view_count == stoptime)
-		{
-			*angle_e = *angle_e + rotateSpeed;
-			*angle_c = *angle_c + rotateSpeed;
-			*view_count = 0;
-		}
-	}
-#ifdef REDFLAG
-#else
-	else if ((*angle_e > PI*7/4) && (*angle_e < PI*7/4+rotateSpeed))
-	{
-		*view_count = *view_count + 1;
-		if (*view_count == stoptime)
-		{
-			*angle_e = *angle_e + rotateSpeed;
-			*angle_c = *angle_c + rotateSpeed;
-			*view_count = 0;
-		}
-	}
-#endif
-	else
-	{
-		*angle_e = *angle_e + rotateSpeed;
-		*angle_c = *angle_c + rotateSpeed;
-	}
-
-}
-
